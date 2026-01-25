@@ -1,0 +1,208 @@
+# N-Structure Momentum Breakout Strategy Configuration
+# =====================================================
+# OPTIMIZED from 3-month backtest: +₹42,659 profit
+
+strategy:
+  name: "N-Structure Momentum Breakout"
+  version: "1.2.0"  # v1.2 with re-entry
+  timeframe: "1m"  # 1-minute candles only
+
+# Index Configuration
+index:
+  symbol: "NIFTY"
+  token: "99926000"  # NIFTY 50 Index token (correct for SmartAPI ltpData)
+  exchange: "NSE"
+  exchange_type: 1  # NSE_CM
+
+# Option Configuration
+option:
+  underlying: "NIFTY"
+  exchange: "NFO"
+  exchange_type: 2  # NSE_FO
+  expiry_preference: "weekly"  # weekly or monthly
+  
+  # ATM Strike Selection
+  strike_selection:
+    method: "atm_premium_filter"
+    premium_min: 90   # Minimum premium in ₹
+    premium_max: 110  # Maximum premium in ₹
+    strike_range: 3   # Check ±3 strikes from ATM
+    
+  # Re-evaluation triggers
+  reeval_interval_minutes: 15
+  reeval_index_move: 50  # Re-evaluate if index moves ₹50
+
+# Technical Indicators
+indicators:
+  ema:
+    fast_period: 9
+    slow_period: 15
+    
+  # N-Structure Parameters (OPTIMIZED)
+  n_structure:
+    min_hl_gap_candles: 5     # Minimum candles between HL1 and HL2
+    min_hl_gap_points: 3.0    # INCREASED from 2.0 for better momentum validation
+    entry_buffer: 1.5         # Entry trigger: High + 1.5 points
+    
+  # Divergence Detection
+  divergence:
+    roc_period: 3             # Rate of Change over 3 candles
+    index_sideways_threshold: 0.0005  # 0.05% - Index considered sideways
+    option_strength_threshold: 0.0005  # 0.05% - Option shows strength
+
+# Entry Logic (OPTIMIZED from backtest)
+entry:
+  buffer_points: 1.5          # Entry trigger: High + 1.5 points
+  limit_buffer_points: 2.0    # Limit price: High + 2.0 points
+  order_type: "STOPLOSS_LIMIT"
+  variety: "STOPLOSS"
+  product_type: "INTRADAY"    # MIS for intraday
+  
+  # Entry Filters (from backtest)
+  min_candle_body_pct: 50     # Min 50% body (strong candle)
+  min_candle_range: 3.0       # Min 3 points range
+  close_near_high_pct: 30     # Close must be in top 30%
+
+# Exit Logic - UNLIMITED TRAILING (OPTIMIZED)
+exit:
+  # Initial Stop Loss
+  initial_sl_points: 10.0     # FIXED 10 point SL
+  
+  # NO FIXED TARGET - Let winners run!
+  use_fixed_target: false
+  target_points: 0            # Disabled - use TSL
+  
+  # Trailing Stop Loss - STRUCTURE BASED (v1.1)
+  trailing:
+    enabled: true
+    method: "structure_hl"    # HL-based trailing (not candle low)
+    
+    # Phase 1: Breakeven
+    breakeven_trigger_points: 8.0   # Move SL to BE when +8 points
+    
+    # Phase 2: Structure TSL (N-Structure v1.1)
+    structure_tsl:
+      min_hls_required: 2           # Need 2+ HLs to activate
+      require_profit: false         # Structure-first, not profit-first
+      tsl_buffer: 2.5               # Buffer below swing low
+      use_second_hl: true           # Use HL[-2] for more room
+      
+    # Phase 3: Tight trail after big profit
+    tight_trail:
+      trigger_points: 20.0          # +20 points (moved from +15)
+      buffer: 1.5                   # Tighter buffer
+      
+  # SL Breath Rule (v1.1)
+  sl_breath:
+    enabled: true
+    max_breaths: 1                  # Allow 1 candle breath
+    structure_required: true        # Only if structure intact
+    within_range_points: 3.0        # Within 3pt of SL
+
+# Risk Management (OPTIMIZED)
+risk:
+  # Position Sizing - FIXED 4 LOTS
+  lot_size: 65                # NIFTY lot = 65 qty (updated)
+  num_lots: 4                 # Always 4 lots = 260 qty
+  fixed_quantity: 260         # 65 × 4
+  
+  # Per Trade Risk
+  sl_points: 10.0             # 10 point SL
+  risk_per_trade: 2600        # ₹2,600 per trade (10 × 260)
+  
+  # Circuit Breakers - MAX SL ONLY!
+  max_sl_per_day: 3           # ONLY limiter: 3 SL hits max
+  max_daily_loss: 7800        # 3 × ₹2,600 = ₹7,800 max
+  
+  # NO trade limit - unlimited trades until 3 SL
+  max_trades_per_day: 999     # Effectively unlimited
+  
+  # Cooldown
+  cooldown_candles: 15        # Wait 15 candles after trade
+  cooldown_after_sl: 30       # Double cooldown after SL hit
+  
+  # Capital (for paper trading)
+  paper_capital: 100000       # ₹1,00,000
+
+# RE-ENTRY LOGIC (NEW - Option A)
+reentry:
+  enabled: true
+  method: "hh_breakout"       # Re-enter on new HH breakout
+  max_reentries_per_day: 2    # Max 2 re-entries
+  min_hh_gap_points: 2.0      # HH must be 2+ points above SL exit
+  
+  # Entry filters (slightly relaxed)
+  min_candle_body_pct: 40     # 40% body (relaxed from 50%)
+  min_candle_range: 2.0       # 2 points (relaxed from 3)
+
+# Timing
+timing:
+  market_open: "09:15"
+  market_close: "15:30"
+  trading_start: "09:50"      # Don't trade first 35 mins
+  no_new_trades_after: "12:30" # Entries only till 12:30
+  manage_till: "14:40"        # Manage active trades till 2:40
+  instrument_download_time: "08:30"
+  
+  # Session Management
+  auto_logout: true
+  logout_time: "15:35"
+
+# Data Management
+data:
+  # Candle Synchronization
+  sync_tolerance_ms: 500      # Max timestamp difference for sync
+  candle_buffer_size: 100     # Keep last 100 candles in memory
+  
+  # Persistence
+  state_db_path: "data/state.db"
+  
+# Logging
+logging:
+  level: "INFO"
+  format: "structured"        # structured or simple
+  log_dir: "data/logs"
+  
+  # Log Files
+  main_log: "trading.log"
+  signal_log: "signals.jsonl"
+  order_log: "orders.jsonl"
+  state_log: "states.jsonl"
+
+# API Rate Limits (Angel One)
+rate_limits:
+  orders_per_second: 9
+  position_poll_interval: 5   # Poll position every 5 seconds
+  websocket_heartbeat: 30     # Ping every 30 seconds
+
+# Paper Trading Mode
+paper_trading:
+  enabled: true               # Set to false for live trading
+  simulate_fills: true
+  simulated_slippage: 0.5     # Assume 0.5 point slippage
+
+# Telegram Notifications (v1.2)
+telegram:
+  enabled: true               # Set to true to enable notifications
+  bot_token: ""               # Uses TELEGRAM_BOT_TOKEN from .env
+  chat_id: ""                 # Uses TELEGRAM_CHAT_ID from .env
+  # Notification settings
+  notify_entry: true          # Entry alerts
+  notify_exit: true           # Exit alerts (SL/TSL)
+  notify_sl_hit: true         # SL hit alerts
+  notify_reentry: true        # Re-entry opportunity alerts
+  notify_daily_summary: true  # End of day summary
+  notify_errors: true         # Error alerts
+
+# Strategy Filters (v1.3)
+filters:
+  # Volume Filter
+  enable_volume: true         # Reject low volume setups
+  volume_lookback: 20         # Candles for average calculation
+  min_volume_ratio: 0.8       # Min 80% of average volume
+  
+  # Trend Filter
+  enable_trend: true          # Check EMA alignment and trend
+  
+  # Time Filter
+  enable_time: true           # Optimal trading window check

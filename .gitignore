@@ -1,0 +1,70 @@
+# Environment & Credentials
+.env
+config/credentials.yaml
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data Files (large)
+data/instruments/*.csv
+data/historical/
+
+# Logs (keep structure, ignore contents)
+data/logs/*.log
+data/logs/*.jsonl
+logs/
+*.log
+paper_trading.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Temp Files
+*.tmp
+*.temp
+.cache/
+.pytest_cache/
+
+# Data cache
+data/cache/
+data/state.db
