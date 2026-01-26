@@ -122,6 +122,7 @@ def main():
         logger.info(f"Got {len(index_candles)} NIFTY candles")
         
         # Create V2 backtester with FIXED 4 lots (260 qty)
+        # v1.2 Stable: All v1.3 optimizations DISABLED
         backtester = NStructureBacktesterV2(
             # Capital & Risk (for daily limits)
             capital=args.capital,
@@ -132,7 +133,7 @@ def main():
             entry_buffer=args.entry_buffer,
             min_hl_gap=args.min_hl_gap,
             
-            # TSL
+            # TSL - Structure-based (v1.2)
             tsl_buffer=2.5,
             use_structure_tsl=True,
             
@@ -142,7 +143,16 @@ def main():
             
             # FIXED position size: 4 lots × 65 = 260 qty
             lot_size=args.lot_size,
-            num_lots=args.num_lots
+            num_lots=args.num_lots,
+            
+            # v1.2 Stable: DISABLE all v1.3 optimizations
+            enable_volume_filter=False,      # Disabled - too restrictive
+            enable_trend_filter=False,       # Disabled - blocks valid setups
+            enable_atr_sl=False,             # Use fixed 10pt SL
+            enable_partial_profits=False,    # No partial exits
+            enable_volatility_filter=False,  # No volatility filtering
+            enable_drawdown_protection=True, # Keep this - useful safety
+            enable_atr_tsl=False,            # Use structure-based TSL
         )
         
         logger.info("\n🎯 Running N-Structure V2 Backtest (UNLIMITED TSL)...")

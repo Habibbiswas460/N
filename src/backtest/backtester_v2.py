@@ -72,31 +72,56 @@ class NStructure:
     The N-Structure pattern as per Strategy Definition Document.
     
     Components:
-    - breakout_high: The resistance level that was broken
-    - pullback_low: The low of the pullback (HL1)
-    - higher_low: The second higher low (HL2)
-    - entry_trigger: breakout_high + buffer
+    - breakout_high: The resistance level that was broken (for CE)
+    - breakdown_low: The support level that was broken (for PE)
+    - pullback_low: The low of the pullback (HL1) for CE
+    - pullback_high: The high of the bounce (LH1) for PE
+    - higher_low: The second higher low (HL2) for CE
+    - lower_high: The second lower high (LH2) for PE
+    - entry_trigger: breakout_high + buffer (CE) or breakdown_low - buffer (PE)
     """
+    # CE (Bullish) pattern
     breakout_high: float = 0.0
     pullback_low: float = 0.0      # HL1
     higher_low: float = 0.0         # HL2
-    entry_trigger: float = 0.0      # breakout_high + 1.5
+    
+    # PE (Bearish) pattern  
+    breakdown_low: float = 0.0
+    pullback_high: float = 0.0     # LH1
+    lower_high: float = 0.0        # LH2
+    
+    # Common
+    entry_trigger: float = 0.0      # breakout_high + 1.5 (CE) or breakdown_low - 1.5 (PE)
     formation_time: Optional[datetime] = None
     is_valid: bool = False
+    direction: str = "CE"           # "CE" for bullish, "PE" for bearish
     
     def validate(self, min_hl_gap: float = 2.0) -> bool:
         """
-        Validate N-Structure as per Section 4.2.
+        Validate N-Structure pattern.
         
+        For CE (bullish):
         - HL2 > HL1 (Higher Low confirmed)
-        - Gap between HL1 and HL2 > threshold (momentum check)
-        """
-        if self.higher_low <= self.pullback_low:
-            return False
+        - Gap between HL1 and HL2 > threshold
         
-        hl_gap = self.higher_low - self.pullback_low
-        if hl_gap < min_hl_gap:
-            return False
+        For PE (bearish):
+        - LH2 < LH1 (Lower High confirmed)  
+        - Gap between LH1 and LH2 > threshold
+        """
+        if self.direction == "CE":
+            # Bullish validation
+            if self.higher_low <= self.pullback_low:
+                return False
+            hl_gap = self.higher_low - self.pullback_low
+            if hl_gap < min_hl_gap:
+                return False
+        else:
+            # Bearish validation (PE)
+            if self.lower_high >= self.pullback_high:
+                return False
+            lh_gap = self.pullback_high - self.lower_high
+            if lh_gap < min_hl_gap:
+                return False
             
         self.is_valid = True
         return True
@@ -117,6 +142,7 @@ class Trade:
     n_structure: Optional[NStructure] = None
     divergence_strength: float = 0.0
     sl_breath_used: bool = False  # N-Structure v1.1: One candle breath allowance
+    direction: str = "CE"  # CE (bullish) or PE (bearish)
     
     @property
     def is_open(self) -> bool:
@@ -649,6 +675,9 @@ class NStructureBacktesterV2:
         - No fixed target (let winners run with TSL)
         - Exit only on TSL hit or EOD
         
+        CE: profit = exit - entry (price goes up = profit)
+        PE: profit = entry - exit (price goes down = profit)
+        
         Returns: (should_exit, reason, exit_price)
         """
         if not self.current_trade:
@@ -656,17 +685,17 @@ class NStructureBacktesterV2:
         
         entry = self.current_trade.entry_price
         sl = self.current_trade.current_sl
-        
-        # NO FIXED TARGET - Let profits run with trailing SL!
-        # (Uncomment below if you want a safety target)
-        # target = entry + self.target_points
-        # if candle.high >= target:
-        #     return True, "Target Hit", target
+        direction = self.current_trade.direction
         
         # Check SL/TSL Hit - with N-Structure v1.1 BREATH RULE
         if candle.low <= sl:
             exit_price = sl
-            profit = exit_price - entry
+            
+            # Calculate profit based on direction
+            if direction == "CE":
+                profit = exit_price - entry  # CE: exit - entry
+            else:  # PE
+                profit = entry - exit_price  # PE: entry - exit
             
             if sl > self.current_trade.initial_sl:
                 # Trailing SL was triggered
@@ -714,28 +743,43 @@ class NStructureBacktesterV2:
         ema15: float
     ) -> bool:
         """
-        IDLE State: Looking for Resistance Breakout.
+        IDLE State: Looking for Breakout (CE) or Breakdown (PE).
         
-        Transition to SETUP when:
-        - Price breaks above recent swing high
+        CE Setup (Bullish):
         - In uptrend (EMA9 > EMA15)
+        - Price breaks above recent swing high
+        
+        PE Setup (Bearish):
+        - In downtrend (EMA9 < EMA15)
+        - Price breaks below recent swing low
         """
-        if not self._is_uptrend(ema9, ema15):
-            return False
+        # Check for CE (Bullish) setup - Uptrend
+        if self._is_uptrend(ema9, ema15) and len(self.swing_highs) >= 1:
+            recent_high = self.swing_highs[-1].price
+            if candle.close > recent_high:
+                self.n_structure = NStructure()  # Reset
+                self.n_structure.direction = "CE"
+                self.n_structure.breakout_high = recent_high
+                self._transition_state(TradingState.SETUP, f"CE Breakout above {recent_high:.2f}")
+                self.setups_detected += 1
+                return True
         
-        if len(self.swing_highs) < 1:
-            return False
-        
-        recent_high = self.swing_highs[-1].price
-        
-        # Check for breakout
-        if candle.close > recent_high:
-            self.n_structure.breakout_high = recent_high
-            self._transition_state(TradingState.SETUP, f"Breakout above {recent_high:.2f}")
-            self.setups_detected += 1
-            return True
+        # Check for PE (Bearish) setup - Downtrend
+        if self._is_downtrend(ema9, ema15) and len(self.swing_lows) >= 1:
+            recent_low = self.swing_lows[-1].price
+            if candle.close < recent_low:
+                self.n_structure = NStructure()  # Reset
+                self.n_structure.direction = "PE"
+                self.n_structure.breakdown_low = recent_low
+                self._transition_state(TradingState.SETUP, f"PE Breakdown below {recent_low:.2f}")
+                self.setups_detected += 1
+                return True
         
         return False
+    
+    def _is_downtrend(self, ema9: float, ema15: float) -> bool:
+        """Check if in downtrend (EMA9 < EMA15)."""
+        return ema9 < ema15
     
     def _process_setup_state(
         self,
@@ -744,25 +788,41 @@ class NStructureBacktesterV2:
         ema15: float
     ) -> bool:
         """
-        SETUP State: Monitoring for Pullback to EMA.
+        SETUP State: Monitoring for Pullback/Bounce to EMA.
         
-        Transition to VALIDATION when:
-        - Price pulls back to EMA zone
-        - Price must NOT close below EMA (hard kill)
+        CE (Bullish): Wait for pullback to EMA zone (low touches EMA)
+        PE (Bearish): Wait for bounce to EMA zone (high touches EMA)
+        
+        Transition to VALIDATION when pullback/bounce detected.
         """
-        # Check for invalidation (close below EMA)
-        if candle.close < ema15:
-            self._transition_state(TradingState.IDLE, "Close below EMA - Setup invalid")
-            self.n_structure = NStructure()
-            return False
+        direction = self.n_structure.direction
+        ema_zone = min(ema9, ema15) if direction == "CE" else max(ema9, ema15)
         
-        # Check for pullback to EMA zone (within 0.3% of EMA)
-        ema_zone = min(ema9, ema15)
-        distance_pct = abs(candle.low - ema_zone) / ema_zone
-        
-        if distance_pct < 0.003 or candle.low <= ema_zone:
-            self._transition_state(TradingState.VALIDATION, "Pullback to EMA detected")
-            return True
+        # Check for invalidation based on direction
+        if direction == "CE":
+            # CE: Close below EMA invalidates bullish setup
+            if candle.close < ema15:
+                self._transition_state(TradingState.IDLE, "CE: Close below EMA - Setup invalid")
+                self.n_structure = NStructure()
+                return False
+            
+            # Check for pullback to EMA zone (within 0.3% of EMA)
+            distance_pct = abs(candle.low - ema_zone) / ema_zone
+            if distance_pct < 0.003 or candle.low <= ema_zone:
+                self._transition_state(TradingState.VALIDATION, "CE: Pullback to EMA detected")
+                return True
+        else:
+            # PE: Close above EMA invalidates bearish setup
+            if candle.close > ema15:
+                self._transition_state(TradingState.IDLE, "PE: Close above EMA - Setup invalid")
+                self.n_structure = NStructure()
+                return False
+            
+            # Check for bounce to EMA zone (within 0.3% of EMA)
+            distance_pct = abs(candle.high - ema_zone) / ema_zone
+            if distance_pct < 0.003 or candle.high >= ema_zone:
+                self._transition_state(TradingState.VALIDATION, "PE: Bounce to EMA detected")
+                return True
         
         return False
     
@@ -773,27 +833,57 @@ class NStructureBacktesterV2:
         ema15: float
     ) -> bool:
         """
-        VALIDATION State: Waiting for Higher Low confirmation.
+        VALIDATION State: Waiting for HL/LH confirmation.
         
-        Transition to READY when:
-        - Higher Low pattern confirmed (HL2 > HL1)
-        - Gap between HLs is sufficient
+        CE: Wait for Higher Low (HL2 > HL1) → bullish continuation
+        PE: Wait for Lower High (LH2 < LH1) → bearish continuation
         """
-        # Check for invalidation
-        if candle.close < ema15:
-            self._transition_state(TradingState.IDLE, "Close below EMA - Pattern invalid")
-            self.n_structure = NStructure()
-            return False
+        direction = self.n_structure.direction
         
-        # Check for Higher Low
-        if self._check_higher_low_pattern():
-            # Set entry trigger with buffer
-            self.n_structure.entry_trigger = self.n_structure.breakout_high + self.entry_buffer
-            self.n_structure.formation_time = candle.timestamp
-            self._transition_state(TradingState.READY, f"HL confirmed, trigger: {self.n_structure.entry_trigger:.2f}")
-            return True
+        # Check for invalidation based on direction
+        if direction == "CE":
+            if candle.close < ema15:
+                self._transition_state(TradingState.IDLE, "CE: Close below EMA - Pattern invalid")
+                self.n_structure = NStructure()
+                return False
+            
+            # Check for Higher Low (CE)
+            if self._check_higher_low_pattern():
+                self.n_structure.entry_trigger = self.n_structure.breakout_high + self.entry_buffer
+                self.n_structure.formation_time = candle.timestamp
+                self._transition_state(TradingState.READY, f"CE: HL confirmed, trigger: {self.n_structure.entry_trigger:.2f}")
+                return True
+        else:
+            if candle.close > ema15:
+                self._transition_state(TradingState.IDLE, "PE: Close above EMA - Pattern invalid")
+                self.n_structure = NStructure()
+                return False
+            
+            # Check for Lower High (PE)
+            if self._check_lower_high_pattern():
+                self.n_structure.entry_trigger = self.n_structure.breakdown_low - self.entry_buffer
+                self.n_structure.formation_time = candle.timestamp
+                self._transition_state(TradingState.READY, f"PE: LH confirmed, trigger: {self.n_structure.entry_trigger:.2f}")
+                return True
         
         return False
+    
+    def _check_lower_high_pattern(self) -> bool:
+        """Check for Lower High pattern (PE setup) - LH2 < LH1 with gap."""
+        if len(self.swing_highs) < 2:
+            return False
+        
+        recent_highs = sorted(self.swing_highs, key=lambda x: x.timestamp, reverse=True)[:2]
+        
+        lh1 = recent_highs[1].price  # First lower high (bounce)
+        lh2 = recent_highs[0].price  # Second lower high (confirmation)
+        
+        self.n_structure.pullback_high = lh1
+        self.n_structure.lower_high = lh2
+        
+        # LH2 must be below LH1 with sufficient gap (>0.5 point)
+        gap = lh1 - lh2
+        return gap >= self.min_hl_gap
     
     def _process_ready_state(
         self,
@@ -804,22 +894,34 @@ class NStructureBacktesterV2:
         """
         READY State: N-Structure confirmed, waiting for entry trigger.
         
-        Transition to ACTIVE when:
-        - Price breaks entry trigger (breakout_high + 1.5)
-        
-        Entry uses Stop-Limit logic (Section 4.4).
+        CE: Entry on breakout above trigger (breakout_high + buffer)
+        PE: Entry on breakdown below trigger (breakdown_low - buffer)
         """
         trigger = self.n_structure.entry_trigger
+        direction = self.n_structure.direction
         
-        # Check for entry trigger
-        if candle.high >= trigger:
+        # Check for entry trigger based on direction
+        trigger_hit = False
+        if direction == "CE":
+            trigger_hit = candle.high >= trigger
+        else:  # PE
+            trigger_hit = candle.low <= trigger
+        
+        if trigger_hit:
             # ===========================================
-            # FILTER 1: Strong Bullish Candle (body > 50%)
+            # FILTER 1: Strong Momentum Candle (body > 50%)
             # ===========================================
             candle_body = candle.close - candle.open
             candle_range = candle.high - candle.low
-            if candle_body <= 0:  # Must be bullish
-                return False
+            
+            if direction == "CE":
+                if candle_body <= 0:  # Must be bullish
+                    return False
+            else:  # PE
+                if candle_body >= 0:  # Must be bearish
+                    return False
+                candle_body = abs(candle_body)  # Use absolute for PE
+            
             if candle_range > 0 and (candle_body / candle_range) < 0.5:
                 return False  # Reject weak candles - need 50%+ body
             
@@ -830,11 +932,16 @@ class NStructureBacktesterV2:
                 return False
             
             # ===========================================
-            # FILTER 3: Close near high (momentum)
+            # FILTER 3: Close momentum check
             # ===========================================
-            close_from_high = candle.high - candle.close
-            if close_from_high > candle_range * 0.3:  # Close must be in top 30% of candle
-                return False
+            if direction == "CE":
+                close_from_high = candle.high - candle.close
+                if close_from_high > candle_range * 0.3:  # Close must be in top 30%
+                    return False
+            else:  # PE
+                close_from_low = candle.close - candle.low
+                if close_from_low > candle_range * 0.3:  # Close must be in bottom 30%
+                    return False
             
             # ===========================================
             # FILTER 4: Avoid first 20 mins (high volatility)
@@ -871,7 +978,6 @@ class NStructureBacktesterV2:
             # v1.3: ATR-based dynamic SL or fixed 10 points
             # ===========================================
             if self.enable_atr_sl and self.atr_calculator and self.atr_calculator.is_ready:
-                # Get ATR-based SL, clamped between min and max
                 atr_sl = self.atr_calculator.get_dynamic_sl(
                     entry_price=entry_price,
                     min_sl=self.min_sl_points,
@@ -881,11 +987,9 @@ class NStructureBacktesterV2:
                 initial_sl = atr_sl
                 logger.debug(f"  → ATR-based SL: {sl_points:.1f}pt (ATR={self.atr_calculator.current_atr:.2f})")
             else:
-                # Fallback to fixed SL
                 sl_points = self.initial_sl_points  # Default 10 points
                 initial_sl = entry_price - sl_points
             
-            # FIXED QUANTITY: Always 4 lots (65 × 4 = 260 qty)
             fixed_qty = self.fixed_qty  # 260 qty
             
             # Clear trade swing lows for fresh TSL tracking
@@ -896,8 +1000,9 @@ class NStructureBacktesterV2:
                 entry_price=entry_price,
                 initial_sl=initial_sl,
                 current_sl=initial_sl,
-                quantity=fixed_qty,  # Fixed 4 lots = 260 qty
-                n_structure=self.n_structure
+                quantity=fixed_qty,
+                n_structure=self.n_structure,
+                direction=direction  # CE or PE
             )
             
             # v1.3: Register with partial profit manager
@@ -906,16 +1011,24 @@ class NStructureBacktesterV2:
             
             self.daily_trades += 1
             self.entries_triggered += 1
-            self._transition_state(TradingState.ACTIVE, f"Entry @ {entry_price:.2f}")
-            logger.info(f"📈 ENTRY @ ₹{entry_price:.2f} | SL: ₹{initial_sl:.2f} ({sl_points:.0f}pt) | Qty: {fixed_qty} ({self.num_lots} lots) | Risk: ₹{sl_points * fixed_qty:.0f} | {ts}")
+            emoji = "📈" if direction == "CE" else "📉"
+            self._transition_state(TradingState.ACTIVE, f"{direction} Entry @ {entry_price:.2f}")
+            logger.info(f"{emoji} {direction} ENTRY @ ₹{entry_price:.2f} | SL: ₹{initial_sl:.2f} ({sl_points:.0f}pt) | Qty: {fixed_qty} ({self.num_lots} lots) | Risk: ₹{sl_points * fixed_qty:.0f} | {ts}")
             return True
         
-        # Check for pattern invalidation (new lower low)
-        if len(self.swing_lows) >= 2:
-            if candle.low < self.n_structure.higher_low - 5:
-                self._transition_state(TradingState.IDLE, "Pattern broken - new lower low")
-                self.n_structure = NStructure()
-                return False
+        # Check for pattern invalidation
+        if direction == "CE":
+            if len(self.swing_lows) >= 2:
+                if candle.low < self.n_structure.higher_low - 5:
+                    self._transition_state(TradingState.IDLE, "CE: Pattern broken - new lower low")
+                    self.n_structure = NStructure()
+                    return False
+        else:  # PE
+            if len(self.swing_highs) >= 2:
+                if candle.high > self.n_structure.lower_high + 5:
+                    self._transition_state(TradingState.IDLE, "PE: Pattern broken - new higher high")
+                    self.n_structure = NStructure()
+                    return False
         
         return False
     
@@ -992,6 +1105,10 @@ class NStructureBacktesterV2:
             self.current_trade.exit_price = exit_price
             self.current_trade.exit_reason = reason
             
+            # Calculate PnL based on direction (CE vs PE)
+            direction = self.current_trade.direction
+            entry_price = self.current_trade.entry_price
+            
             # v1.3: Calculate PnL including partial exits
             if self.partial_profit_mgr and self.partial_profit_mgr.position:
                 # Close remaining position
@@ -999,7 +1116,11 @@ class NStructureBacktesterV2:
                 total_pnl = self.partial_profit_mgr.get_total_pnl()
                 self.current_trade.pnl = total_pnl
             else:
-                self.current_trade.pnl = (exit_price - self.current_trade.entry_price) * self.fixed_qty
+                # CE: profit when price goes up, PE: profit when price goes down
+                if direction == "CE":
+                    self.current_trade.pnl = (exit_price - entry_price) * self.fixed_qty
+                else:  # PE
+                    self.current_trade.pnl = (entry_price - exit_price) * self.fixed_qty
             
             self.trades.append(self.current_trade)
             self.daily_pnl += self.current_trade.pnl
@@ -1009,8 +1130,9 @@ class NStructureBacktesterV2:
             if self.drawdown_protection:
                 self.drawdown_protection.record_trade(self.current_trade.pnl)
             
+            emoji = "📈" if direction == "CE" else "📉"
             pnl_str = f"+₹{self.current_trade.pnl:.0f}" if self.current_trade.pnl > 0 else f"-₹{abs(self.current_trade.pnl):.0f}"
-            logger.info(f"📉 EXIT @ ₹{exit_price:.2f} | {reason} | PnL: {pnl_str} | {ts}")
+            logger.info(f"{emoji} {direction} EXIT @ ₹{exit_price:.2f} | {reason} | PnL: {pnl_str} | {ts}")
             
             # Track SL hits - this is the ONLY limiter!
             is_sl_hit = "SL Hit" in reason and self.current_trade.pnl <= -self.risk_per_trade * 0.5
@@ -1173,15 +1295,12 @@ class NStructureBacktesterV2:
             # Day change check
             self._check_day_change(ts)
             
-            # Skip non-trading hours
-            if not self._is_trading_hours(ts):
+            # Skip pre-market and post-market hours completely
+            t = ts.time()
+            if t < time(9, 15) or t > time(15, 30):
                 continue
             
-            # Kill switch check - but allow exit of active trades
-            if self._check_kill_switch() and self.state != TradingState.ACTIVE:
-                continue
-            
-            # Update EMAs
+            # ALWAYS update EMAs and indicators (even before 9:50)
             self.index_emas.update(candle.close)
             ema9 = self.index_emas.get_value(9)
             ema15 = self.index_emas.get_value(15)
@@ -1193,14 +1312,11 @@ class NStructureBacktesterV2:
             if self.atr_calculator:
                 self.atr_calculator.update(candle.high, candle.low, candle.close)
             
-            # v1.3: Update volatility filter and check if tradeable
+            # v1.3: Update volatility filter
             if self.volatility_filter:
                 self.volatility_filter.update(candle.high, candle.low, candle.close)
-                if not self.volatility_filter.is_tradeable_day() and self.state != TradingState.ACTIVE:
-                    # Skip low/extreme volatility periods for new entries
-                    continue
             
-            # Update volume filter history (even if not in READY state)
+            # Update volume filter history
             if self.volume_filter and hasattr(candle, 'volume') and candle.volume:
                 self.volume_filter.update(candle.volume)
             
@@ -1208,9 +1324,22 @@ class NStructureBacktesterV2:
             if self.trend_filter:
                 self.trend_filter.analyze(candle.close, ema9, ema15)
             
-            # Store candle and detect swings
+            # Store candle and detect swings (always, for indicator warmup)
             self.index_candles.append(candle)
             self._detect_swing_points(candle, idx)
+            
+            # NOW check trading hours for entry/exit actions
+            if not self._is_trading_hours(ts):
+                continue
+            
+            # Kill switch check - but allow exit of active trades
+            if self._check_kill_switch() and self.state != TradingState.ACTIVE:
+                continue
+            
+            # v1.3: Check volatility filter for new entries only
+            if self.volatility_filter:
+                if not self.volatility_filter.is_tradeable_day() and self.state != TradingState.ACTIVE:
+                    continue
             
             # Simulate option premium
             if trade_entry_nifty is not None and trade_entry_premium is not None:
@@ -1298,7 +1427,14 @@ class NStructureBacktesterV2:
                 self.current_trade.exit_time = last.timestamp
                 self.current_trade.exit_price = final_premium
                 self.current_trade.exit_reason = "Backtest End"
-                self.current_trade.pnl = (final_premium - self.current_trade.entry_price) * self.fixed_qty
+                
+                # Calculate PnL based on direction
+                direction = self.current_trade.direction
+                if direction == "CE":
+                    self.current_trade.pnl = (final_premium - self.current_trade.entry_price) * self.fixed_qty
+                else:  # PE
+                    self.current_trade.pnl = (self.current_trade.entry_price - final_premium) * self.fixed_qty
+                
                 self.trades.append(self.current_trade)
                 self.equity_curve.append(self.equity_curve[-1] + self.current_trade.pnl)
         
@@ -1368,6 +1504,12 @@ def print_results_v2(result: BacktestResult):
     print(f"   Losing Trades:     {result.losing_trades}")
     print(f"   Win Rate:          {result.win_rate:.1f}%")
     
+    # CE/PE breakdown
+    ce_trades = [t for t in result.trades if t.direction == "CE"]
+    pe_trades = [t for t in result.trades if t.direction == "PE"]
+    print(f"   CE Trades:         {len(ce_trades)} ({sum(1 for t in ce_trades if t.pnl > 0)} wins)")
+    print(f"   PE Trades:         {len(pe_trades)} ({sum(1 for t in pe_trades if t.pnl > 0)} wins)")
+    
     print(f"\n📈 Setup Statistics:")
     print(f"   Setups Detected:   {result.setups_detected}")
     print(f"   Entries Triggered: {result.entries_triggered}")
@@ -1376,6 +1518,12 @@ def print_results_v2(result: BacktestResult):
     print(f"\n💰 P&L Analysis:")
     pnl_str = f"+₹{result.total_pnl:,.0f}" if result.total_pnl > 0 else f"-₹{abs(result.total_pnl):,.0f}"
     print(f"   Total P&L:         {pnl_str}")
+    ce_pnl = sum(t.pnl for t in ce_trades)
+    pe_pnl = sum(t.pnl for t in pe_trades)
+    ce_pnl_str = f"+₹{ce_pnl:,.0f}" if ce_pnl > 0 else f"-₹{abs(ce_pnl):,.0f}"
+    pe_pnl_str = f"+₹{pe_pnl:,.0f}" if pe_pnl > 0 else f"-₹{abs(pe_pnl):,.0f}"
+    print(f"   CE P&L:            {ce_pnl_str}")
+    print(f"   PE P&L:            {pe_pnl_str}")
     print(f"   Avg Win:           +₹{result.avg_win:,.0f}")
     print(f"   Avg Loss:          -₹{result.avg_loss:,.0f}")
     print(f"   Profit Factor:     {result.profit_factor:.2f}")
@@ -1383,10 +1531,11 @@ def print_results_v2(result: BacktestResult):
     
     if result.trades:
         print(f"\n📝 Trade Log (Last 20):")
-        print("-" * 65)
+        print("-" * 75)
         for i, t in enumerate(result.trades[-20:], 1):
             pnl = f"+₹{t.pnl:.0f}" if t.pnl > 0 else f"-₹{abs(t.pnl):.0f}"
-            print(f"   {i:2}. {t.entry_time.strftime('%d-%b %H:%M')} | "
+            emoji = "📈" if t.direction == "CE" else "📉"
+            print(f"   {i:2}. {emoji} {t.direction} | {t.entry_time.strftime('%d-%b %H:%M')} | "
                   f"Entry: ₹{t.entry_price:.1f} | "
                   f"Exit: ₹{t.exit_price:.1f} | "
                   f"{t.exit_reason:10} | {pnl}")
