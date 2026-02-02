@@ -1,70 +1,72 @@
-# Environment & Credentials
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  N-Structure Trading Bot - Git Ignore                        ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+# ────────────────────────────────────────────────────────────────
+# 🔒 Credentials & Secrets
+# ────────────────────────────────────────────────────────────────
 .env
 config/credentials.yaml
 *.pem
 *.key
+*.secret
 
-# Python
+# ────────────────────────────────────────────────────────────────
+# 🐍 Python
+# ────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
 
-# Virtual Environment
+# ────────────────────────────────────────────────────────────────
+# 📦 Virtual Environment
+# ────────────────────────────────────────────────────────────────
 venv/
+.venv/
 ENV/
 env/
-.venv/
 
-# IDE
+# ────────────────────────────────────────────────────────────────
+# 💻 IDE & Editor
+# ────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+.spyderproject
+.spyproject
 
-# Data Files (large)
-data/instruments/*.csv
-data/historical/
-
-# Logs (keep structure, ignore contents)
-data/logs/*.log
-data/logs/*.jsonl
+# ────────────────────────────────────────────────────────────────
+# 📊 Data & Logs
+# ────────────────────────────────────────────────────────────────
 logs/
 *.log
-paper_trading.log
-
-# Database
+data/logs/
+data/cache/
+data/state.db
 *.db
 *.sqlite
 *.sqlite3
 
-# OS Files
+# ────────────────────────────────────────────────────────────────
+# 🧪 Testing
+# ────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ────────────────────────────────────────────────────────────────
+# 💾 OS Files
+# ────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# Temp Files
 *.tmp
 *.temp
-.cache/
-.pytest_cache/
-
-# Data cache
-data/cache/
-data/state.db

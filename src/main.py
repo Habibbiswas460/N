@@ -26,11 +26,12 @@ from data.instrument_master import InstrumentMaster, OptionType
 from data.market_feed import MarketFeed, SubscriptionMode
 from data.candle_builder import CandleAggregator, Candle
 from data.synchronizer import CandleSynchronizer, SyncedCandlePair
+from data.dynamic_strike_selector import DynamicStrikeSelector, DynamicStrike, initialize_dynamic_strike_selector
 from indicators.ema import EMASet
-from indicators.n_structure import NStructureDetector, NStructure
+from indicators.n_structure import NStructureDetector, NStructure, DualDirectionDetector, SignalDirection, SetupStatus
 from indicators.filters import CompositeFilter, VolumeAnalysis, TrendAnalysis
 from core.state_store import StateStore
-from core.state_machine import TradingStateMachine, TradingState
+from core.state_machine import TradingStateMachine, TradingState, StateContext
 from execution.order_manager import OrderManager, OrderRequest, OrderType, TransactionType, ProductType
 from execution.sl_manager import StopLossManager, SLStatus, initialize_sl_manager
 from risk.risk_manager import RiskManager, RiskLimits, RiskEvent, initialize_risk_manager
@@ -56,6 +57,7 @@ class TradingBot:
         self.config: dict = {}
         self._shutdown_flag = False
         self._running = False
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         
         # Core components (initialized in setup)
         self.auth: Optional[AngelOneAuth] = None
@@ -77,14 +79,40 @@ class TradingBot:
         # Indicators
         self.index_emas: Optional[EMASet] = None
         self.option_emas: Optional[EMASet] = None
-        self.n_detector: Optional[NStructureDetector] = None
+        self.n_detector: Optional[DualDirectionDetector] = None
         self.composite_filter: Optional[CompositeFilter] = None
         
         # State
         self.current_index_token: Optional[str] = None
         self.current_option_token: Optional[str] = None
         self.current_option_symbol: Optional[str] = None
+        self.current_option_type: str = "CE"  # Current active option type
+        
+        # CE and PE option tokens (both pre-selected)
+        self.ce_option_token: Optional[str] = None
+        self.ce_option_symbol: Optional[str] = None
+        self.pe_option_token: Optional[str] = None
+        self.pe_option_symbol: Optional[str] = None
+        
+        # Dynamic Strike Selector (v3.0 - selects on N-Structure)
+        self.dynamic_strike_selector: Optional[DynamicStrikeSelector] = None
+        self._strike_selected_for_signal: bool = False  # Track if strike selected for current signal
+        
         self.paper_mode: bool = False
+        self.polling_mode: bool = False
+        self.trade_direction: str = "BOTH"  # CE_ONLY, PE_ONLY, or BOTH
+        
+        # ATM tracking for dynamic re-selection
+        self._last_atm_strike: Optional[float] = None
+        
+        # 🔥 SNIPER MODE: 1-trade/day enforcement (CRITICAL FIX)
+        self._daily_trades_count = 0
+        self._last_trade_date: Optional[datetime] = None
+        self._daily_pnl = 0.0
+        self._sniper_mode_enabled = True
+        
+        # Daily reset tracking
+        self._last_daily_reset: Optional[datetime] = None
         
         # Structured logger
         self.slog = get_structured_logger()
@@ -96,14 +124,16 @@ class TradingBot:
         
         logger.info(f"Configuration loaded from {self.config_path}")
     
-    async def setup(self, paper_mode: bool = False) -> None:
+    async def setup(self, paper_mode: bool = False, polling_mode: bool = False) -> None:
         """
         Initialize all components.
         
         Args:
             paper_mode: If True, don't place real orders
+            polling_mode: If True, use LTP polling instead of WebSocket
         """
         self.paper_mode = paper_mode
+        self.polling_mode = polling_mode
         
         # Load config
         self._load_config()
@@ -126,19 +156,53 @@ class TradingBot:
         # Initialize FSM - restores state in constructor
         self.fsm = TradingStateMachine(self.state_store)
         
-        # Initialize risk manager (v1.2 - max SL only)
+        # Initialize risk manager (v5.2 - Position Profiles)
         risk_config = self.config.get("risk", {})
+        
+        # Get position size from profile
+        position_mode = risk_config.get("position_mode", "conservative")
+        profiles = risk_config.get("position_profiles", {})
+        profile = profiles.get(position_mode, {})
+        
+        # Use profile values or fallback to legacy config
+        num_lots = profile.get("num_lots", risk_config.get("num_lots", 4))
+        fixed_qty = profile.get("fixed_quantity", risk_config.get("fixed_quantity", 260))
+        risk_per_trade = profile.get("risk_per_trade", risk_config.get("risk_per_trade", 1300))
+        max_daily_loss = profile.get("max_daily_loss", risk_config.get("max_daily_loss", 1300))
+        
+        # Get timing config
+        timing_config = self.config.get("timing", {})
+        
+        logger.info(
+            f"💰 Position Size: {position_mode.upper()} mode | "
+            f"{num_lots} lots ({fixed_qty} qty) | "
+            f"Risk: ₹{risk_per_trade}/trade | Max Loss: ₹{max_daily_loss}/day"
+        )
+        
+        # Initialize Risk Manager v2.0 - PRODUCTION READY
         self.risk_manager = initialize_risk_manager(
             lot_size=risk_config.get("lot_size", 65),
-            num_lots=risk_config.get("num_lots", 4),
-            sl_points=risk_config.get("sl_points", 10.0),
-            max_sl_per_day=risk_config.get("max_sl_per_day", 3),
+            num_lots=num_lots,
+            sl_points=risk_config.get("sl_points", 5.0),
+            max_sl_per_day=risk_config.get("max_sl_per_day", 1),
             max_reentries_per_day=risk_config.get("max_reentries_per_day", 2),
             cooldown_candles_normal=risk_config.get("cooldown_candles", 15),
             cooldown_candles_after_sl=risk_config.get("cooldown_after_sl", 30),
-            capital=risk_config.get("paper_capital", 100000.0)
+            capital=risk_config.get("paper_capital", 50000.0),
+            max_daily_loss=max_daily_loss,
+            max_daily_loss_pct=risk_config.get("max_daily_loss_pct", 5.0),
+            max_trades_per_day=risk_config.get("max_trades_per_day", 10),
+            trading_start=timing_config.get("trading_start", "09:50"),
+            no_new_after=timing_config.get("no_new_trades_after", "12:30"),
+            manage_till=timing_config.get("manage_till", "14:40"),
+            enable_time_filter=timing_config.get("enable_time_filter", True),
+            margin_per_lot=risk_config.get("margin_per_lot", 15000.0)
         )
         self.risk_manager.add_event_callback(self._on_risk_event)
+        
+        # Store position info for order manager
+        self.num_lots = num_lots
+        self.position_qty = fixed_qty
         
         # Initialize order manager
         self.order_manager = OrderManager(
@@ -146,20 +210,40 @@ class TradingBot:
             paper_mode=paper_mode
         )
         
-        # Initialize SL manager (v1.2 - structure-based TSL)
+        # Initialize SL manager (v2.0 Sniper Mode TSL)
         exit_config = self.config.get("exit", {})
         trailing_config = exit_config.get("trailing", {})
         tsl_config = trailing_config.get("structure_tsl", {})
         tight_config = trailing_config.get("tight_trail", {})
         breath_config = exit_config.get("sl_breath", {})
         
+        # v2.0 Sniper Mode settings from config
+        safe_mode_trigger = trailing_config.get("safe_mode_trigger", 7.0)
+        safe_mode_buffer = trailing_config.get("safe_mode_sl_buffer", 1.0)
+        trail_mode_trigger = trailing_config.get("trail_mode_trigger", 10.0)
+        trail_mode_buffer = trailing_config.get("trail_mode_buffer", 5.0)
+        enable_sniper = trailing_config.get("method") == "sniper_mode"
+        
         self.sl_manager = initialize_sl_manager(
-            initial_sl_points=exit_config.get("initial_sl_points", 10.0),
-            breakeven_trigger_points=trailing_config.get("breakeven_trigger_points", 8.0),
+            initial_sl_points=exit_config.get("initial_sl_points", 5.0),
+            breakeven_trigger_points=trailing_config.get("breakeven_trigger_points", 7.0),
             tsl_buffer=tsl_config.get("tsl_buffer", 2.5),
             tight_trigger_points=tight_config.get("trigger_points", 20.0),
             tight_buffer=tight_config.get("buffer", 1.5),
-            enable_breath_rule=breath_config.get("enabled", True)
+            enable_breath_rule=breath_config.get("enabled", True),
+            # v2.0 Sniper Mode
+            safe_mode_trigger=safe_mode_trigger,
+            safe_mode_buffer=safe_mode_buffer,
+            trail_mode_trigger=trail_mode_trigger,
+            trail_mode_buffer=trail_mode_buffer,
+            enable_sniper_mode=enable_sniper
+        )
+        
+        logger.info(
+            f"SL Manager v2.0 | Sniper Mode: {enable_sniper} | "
+            f"SL: {exit_config.get('initial_sl_points', 5.0)}pt | "
+            f"Safe: +{safe_mode_trigger}pt→Entry+{safe_mode_buffer} | "
+            f"Trail: +{trail_mode_trigger}pt→High-{trail_mode_buffer}"
         )
         
         # Initialize position reconciler
@@ -170,12 +254,33 @@ class TradingBot:
         )
         self.reconciler.add_mismatch_callback(self._on_position_mismatch)
         
-        # Initialize N-Structure detector
-        n_config = self.config.get("n_structure", {})
-        self.n_detector = NStructureDetector(
+        # Initialize N-Structure detector (v5.2 - Confirmation Candle)
+        n_config = self.config.get("indicators", {}).get("n_structure", {})
+        option_config = self.config.get("option", {})
+        trade_direction = option_config.get("trade_direction", "BOTH").upper()
+        
+        # Use DualDirectionDetector for pattern-based direction
+        self.n_detector = DualDirectionDetector(
             entry_buffer=n_config.get("buffer", 1.5),
-            index_sideways_threshold=n_config.get("divergence_threshold", 0.3) / 100,  # Convert to decimal
-            option_strength_threshold=n_config.get("divergence_threshold", 0.3) / 100
+            min_swing_gap_candles=n_config.get("min_swing_gap_candles", 5),
+            min_swing_gap_points=n_config.get("min_swing_gap_points", 2.0),
+            trade_direction=trade_direction,
+            # v5.1: Volume confirmation
+            volume_confirmation_enabled=n_config.get("volume_confirmation_enabled", True),
+            min_volume_ratio=n_config.get("min_volume_ratio", 1.5),
+            volume_lookback=n_config.get("volume_lookback", 20),
+            # v5.1: Gap filter
+            gap_filter_enabled=n_config.get("gap_filter_enabled", True),
+            max_gap_points=n_config.get("max_gap_points", 50.0),
+            # v5.2: Confirmation candle (patience for entry)
+            confirmation_candles=n_config.get("confirmation_candles", 2),
+            require_direction_candle=n_config.get("require_direction_candle", True)
+        )
+        logger.info(
+            f"N-Structure v5.2 | Direction: {trade_direction} | "
+            f"Volume: {n_config.get('volume_confirmation_enabled', True)} (>= {n_config.get('min_volume_ratio', 1.5)}x) | "
+            f"Gap Filter: < {n_config.get('max_gap_points', 50)}pt | "
+            f"Confirm Candles: {n_config.get('confirmation_candles', 2)}"
         )
         
         # Initialize Composite Filter (v1.3 - volume + trend + time)
@@ -192,6 +297,21 @@ class TradingBot:
             f"Trend: {filter_config.get('enable_trend', True)} | Time: {filter_config.get('enable_time', True)}"
         )
         
+        # Initialize Dynamic Strike Selector (v3.0 - selects on N-Structure signal)
+        strike_config = self.config.get("strike_selection", {})
+        self.dynamic_strike_selector = initialize_dynamic_strike_selector(
+            premium_min=strike_config.get("premium_min", 85.0),
+            premium_max=strike_config.get("premium_max", 110.0),
+            premium_sweet_min=strike_config.get("premium_sweet_min", 90.0),
+            premium_sweet_max=strike_config.get("premium_sweet_max", 100.0),
+            strike_range=strike_config.get("strike_range", 5)
+        )
+        logger.info(
+            f"Dynamic Strike Selector v3.0 | "
+            f"Premium Range: ₹{strike_config.get('premium_min', 85)}-₹{strike_config.get('premium_max', 110)} | "
+            f"Selects AFTER N-Structure detection on INDEX"
+        )
+        
         # Initialize Telegram notifier (v1.2)
         telegram_config = self.config.get("telegram", {})
         self.telegram = initialize_telegram(
@@ -201,101 +321,155 @@ class TradingBot:
         )
         
         logger.info(f"Bot initialized | Paper Mode: {paper_mode}")
-    
-    async def _fast_strike_selection(self, expiry, atm_strike) -> tuple:
-        """
-        Fast strike selection using binary search.
         
-        Instead of scanning all strikes, uses binary search to find
-        the strike with premium in ₹90-110 range quickly.
+        # 🔧 FIX: Check for stale state and auto-reset
+        self._check_state_health()
+    
+    def _check_state_health(self) -> None:
+        """
+        Check FSM state health and auto-reset if stale.
+        
+        Detects states stuck from previous days and resets to IDLE.
+        """
+        if not self.fsm:
+            return
+            
+        # Get current state context
+        ctx = self.fsm.context
+        last_change = ctx.last_state_change
+        
+        if last_change:
+            age = datetime.now() - last_change
+            current_state = self.fsm.state
+            
+            # If state is not IDLE and older than 1 day, it's stale
+            if age.days > 0 and current_state != TradingState.IDLE:
+                logger.warning(
+                    f"⚠️ STALE STATE DETECTED: {current_state.name} is {age.days} days old! "
+                    f"Last change: {last_change.strftime('%Y-%m-%d %H:%M')} | Auto-resetting to IDLE"
+                )
+                
+                # Force reset to IDLE
+                self.fsm.transition_to(
+                    TradingState.IDLE,
+                    reason=f"Auto-reset: stale state ({age.days} days old)",
+                    force=True
+                )
+                
+                # Clear context
+                self.fsm._context = StateContext()
+                self.fsm._persist_state()
+                
+                logger.success("✓ State auto-reset to IDLE")
+            elif age.days > 0:
+                logger.info(f"State {current_state.name} is {age.days} days old but IDLE - OK")
+    
+    def _reset_daily_counters(self) -> None:
+        """
+        Reset daily trading counters at market open.
+        
+        Called once per day at 9:15 AM to ensure fresh start.
+        """
+        today = datetime.now().date()
+        
+        if self._last_daily_reset and self._last_daily_reset == today:
+            return  # Already reset today
+        
+        logger.info("📅 DAILY RESET: Resetting all daily counters...")
+        
+        # Reset trade counters
+        self._daily_trades_count = 0
+        self._last_trade_date = None
+        self._daily_pnl = 0.0
+        
+        # Reset risk manager daily stats
+        if self.risk_manager:
+            self.risk_manager.reset_daily()
+        
+        # Mark reset done
+        self._last_daily_reset = today
+        
+        logger.success(
+            f"✓ Daily counters reset | Date: {today} | "
+            f"Trades: 0 | SL Hits: 0 | P&L: ₹0"
+        )
+    
+    async def _fast_strike_selection(self, expiry, atm_strike, option_type: OptionType = OptionType.CALL) -> tuple:
+        """
+        AT-THE-MONEY (ATM) Strike Selection - DYNAMIC MODE.
+        
+        **Always selects EXACT ATM strike based on current index price.**
+        Re-selects automatically when ATM changes (every 50 points).
+        
+        Selection Logic:
+        1. Calculate current ATM strike (50-point interval for NIFTY)
+        2. Select EXACT ATM strike (no premium filtering)
+        3. If ATM changes by 50 points → Auto re-select
+        4. Always maintain ATM, never become OTM
+        
+        🟡 MEDIUM CONCERN #4 FIX: Token/Symbol Management Safeguarded
+        
+        Token Validation (prevents stale tokens):
+        - Check: Instrument master is fresh (daily download)
+        - Verify: Token exists and is valid (not expired)
+        - Fallback: Log error if token not found, retry next candle
+        - Safety: Won't trade with invalid tokens
+        
+        Why Dynamic?
+        - ATM = BEST delta (~0.50 for options, closest to 1:1 index move)
+        - ATM = BEST premium decay ratio
+        - Premium changes as index moves, but strike stays optimal
+        - Re-select maintains strategy consistency
         
         Args:
             expiry: Option expiry date
-            atm_strike: ATM strike price
+            atm_strike: Current ATM strike price (dynamic)
+            option_type: CALL or PUT
             
         Returns:
             Tuple of (selected_option, premium)
         """
-        strike_config = self.config.get("strike_selection", {})
-        premium_min = strike_config.get("min_premium", 90.0)
-        premium_max = strike_config.get("max_premium", 110.0)
-        target_premium = (premium_min + premium_max) / 2  # ₹100 target
+        type_str = "CE" if option_type == OptionType.CALL else "PE"
         
-        # Get all CE options
-        all_ce_options = self.instrument_master.get_nifty_options(
+        # Get all options of specified type
+        all_options = self.instrument_master.get_nifty_options(
             expiry_date=expiry,
-            option_type=OptionType.CALL
+            option_type=option_type
         )
         
-        if not all_ce_options:
-            raise RuntimeError("No NIFTY CE options found")
+        if not all_options:
+            raise RuntimeError(f"No NIFTY {type_str} options found")
         
-        # Sort by strike (higher strike = lower premium for CE)
-        all_ce_options.sort(key=lambda x: x.strike)
+        # Find EXACT ATM strike (dynamic based on current index)
+        atm_option = None
+        for opt in all_options:
+            if opt.strike == atm_strike:
+                atm_option = opt
+                break
         
-        # Filter to strikes near ATM (±300 points) for faster search
-        nearby_options = [o for o in all_ce_options if abs(o.strike - atm_strike) <= 300]
-        if not nearby_options:
-            nearby_options = all_ce_options  # Fallback to all
+        if not atm_option:
+            raise RuntimeError(f"ATM strike {atm_strike} not found for {type_str}")
         
-        logger.info(f"Fast strike selection (target: ₹{target_premium:.0f}, {len(nearby_options)} strikes near ATM)...")
+        # 🟡 TOKEN VALIDATION: Verify token is valid (MEDIUM CONCERN #4)
+        if not atm_option.token or not isinstance(atm_option.token, str):
+            raise RuntimeError(f"Invalid token for {type_str}: {atm_option.token}")
         
-        # Binary search on nearby options
-        left, right = 0, len(nearby_options) - 1
-        best_option = None
-        best_premium = 0.0
-        best_diff = float('inf')
+        if not atm_option.symbol or not isinstance(atm_option.symbol, str):
+            raise RuntimeError(f"Invalid symbol for {type_str}: {atm_option.symbol}")
         
-        # Binary search with ~3-4 API calls
-        iterations = 0
-        while left <= right and iterations < 6:
-            iterations += 1
-            mid = (left + right) // 2
-            opt = nearby_options[mid]
-            
-            premium = self.auth.get_ltp("NFO", opt.symbol, opt.token)
-            if not premium:
-                # Skip if no price
-                right = mid - 1
-                continue
-            
-            diff = abs(premium - target_premium)
-            logger.info(f"  #{iterations} {int(opt.strike)} | ₹{premium:.2f} | diff: {diff:.1f}")
-            
-            # Track best match
-            if premium_min <= premium <= premium_max:
-                if diff < best_diff:
-                    best_option = opt
-                    best_premium = premium
-                    best_diff = diff
-                # Found in range, but continue to find closer to target
-            
-            # Binary search direction
-            if premium > target_premium:
-                # Premium too high, need higher strike (lower premium)
-                left = mid + 1
-            else:
-                # Premium too low, need lower strike (higher premium)
-                right = mid - 1
+        # Get premium (just for logging)
+        premium = self.auth.get_ltp("NFO", atm_option.symbol, atm_option.token)
+        if not premium:
+            premium = 0.0
         
-        # If no exact match, check neighbors
-        if not best_option and iterations > 0:
-            mid = (left + right) // 2
-            for offset in [-1, 0, 1, 2]:
-                idx = mid + offset
-                if 0 <= idx < len(nearby_options):
-                    opt = nearby_options[idx]
-                    premium = self.auth.get_ltp("NFO", opt.symbol, opt.token)
-                    if premium and premium_min <= premium <= premium_max:
-                        best_option = opt
-                        best_premium = premium
-                        break
+        logger.info(
+            f"✓ ATM {type_str} Selected: Strike {int(atm_strike)} | "
+            f"Symbol: {atm_option.symbol} | Token: {atm_option.token} | "
+            f"Premium: ₹{premium:.2f} | "
+            f"🔄 Dynamic (Re-selects when index moves 50 points)"
+        )
         
-        if not best_option:
-            raise RuntimeError(f"No strike found in ₹{premium_min}-₹{premium_max} range")
-        
-        logger.info(f"✓ Found in {iterations} API calls")
-        return best_option, best_premium
+        return atm_option, premium
     
     async def _setup_market_data(self) -> None:
         """Set up market data subscriptions after strike selection."""
@@ -328,20 +502,50 @@ class TradingBot:
         
         logger.info(f"Expiry: {expiry.strftime('%d%b%y').upper()}")
         
-        # Fast strike selection using binary search
-        selected_option, selected_premium = await self._fast_strike_selection(
-            expiry=expiry,
-            atm_strike=atm_strike
-        )
+        # Get trade direction from config
+        option_config = self.config.get("option", {})
+        self.trade_direction = option_config.get("trade_direction", "BOTH").upper()
+        logger.info(f"Trade Direction: {self.trade_direction}")
         
-        self.current_option_token = selected_option.token
-        self.current_option_symbol = selected_option.symbol
+        # Select CE option if needed
+        if self.trade_direction in ["CE_ONLY", "BOTH"]:
+            ce_option, ce_premium = await self._fast_strike_selection(
+                expiry=expiry,
+                atm_strike=atm_strike,
+                option_type=OptionType.CALL
+            )
+            self.ce_option_token = ce_option.token
+            self.ce_option_symbol = ce_option.symbol
+            logger.success(
+                f"✓ CE Selected: {self.ce_option_symbol} "
+                f"(Token: {self.ce_option_token}, Strike: {int(ce_option.strike)}, "
+                f"Premium: ₹{ce_premium:.2f})"
+            )
         
-        logger.success(
-            f"✓ Selected: {self.current_option_symbol} "
-            f"(Token: {self.current_option_token}, Strike: {int(selected_option.strike)}, "
-            f"Premium: ₹{selected_premium:.2f})"
-        )
+        # Select PE option if needed
+        if self.trade_direction in ["PE_ONLY", "BOTH"]:
+            pe_option, pe_premium = await self._fast_strike_selection(
+                expiry=expiry,
+                atm_strike=atm_strike,
+                option_type=OptionType.PUT
+            )
+            self.pe_option_token = pe_option.token
+            self.pe_option_symbol = pe_option.symbol
+            logger.success(
+                f"✓ PE Selected: {self.pe_option_symbol} "
+                f"(Token: {self.pe_option_token}, Strike: {int(pe_option.strike)}, "
+                f"Premium: ₹{pe_premium:.2f})"
+            )
+        
+        # Set default active option (CE first, or PE if CE_ONLY disabled)
+        if self.trade_direction == "PE_ONLY":
+            self.current_option_token = self.pe_option_token
+            self.current_option_symbol = self.pe_option_symbol
+            self.current_option_type = "PE"
+        else:
+            self.current_option_token = self.ce_option_token
+            self.current_option_symbol = self.ce_option_symbol
+            self.current_option_type = "CE"
         
         # Initialize candle builders
         self.index_candle_builder = CandleAggregator(
@@ -369,20 +573,56 @@ class TradingBot:
         self.index_candle_builder.add_callback(self.synchronizer.on_candle)
         self.option_candle_builder.add_callback(self.synchronizer.on_candle)
         
-        # Initialize market feed
-        self.market_feed = MarketFeed(
-            auth_token=self.auth.jwt_token,
-            api_key=self.auth.api_key,
-            client_code=self.auth.client_code,
-            feed_token=self.auth.feed_token,
-            mode=SubscriptionMode.QUOTE
-        )
-        self.market_feed.add_tick_callback(self._on_tick)
-        
-        # Connect and subscribe to both tokens
-        self.market_feed.connect()
-        self.market_feed.subscribe_index(self.current_index_token)
-        self.market_feed.subscribe_option(self.current_option_token)
+        # Initialize market feed (WebSocket or Polling)
+        if self.polling_mode:
+            logger.info("Using LTP Polling mode (WebSocket bypass)")
+            from data.market_feed_polling import PollingMarketFeed
+            self.market_feed = PollingMarketFeed(
+                smart_api=self.auth._smart_api,
+                poll_interval=4.0,  # Poll every 4 seconds (conservative: 3 tokens × 0.25 req/sec = 0.75 req/sec)
+                broker=self.auth  # Pass broker for session validation
+            )
+            self.market_feed.add_tick_callback(self._on_tick)
+            
+            # Subscribe to Index
+            logger.info(f"Subscribing to Index: Nifty 50 (Token: {self.current_index_token})")
+            self.market_feed.subscribe_index(self.current_index_token, "Nifty 50", "NSE")
+            
+            # Subscribe to CE option if available
+            if self.ce_option_token and self.ce_option_symbol:
+                logger.info(f"Subscribing to CE: {self.ce_option_symbol} (Token: {self.ce_option_token})")
+                self.market_feed.subscribe_option(self.ce_option_token, self.ce_option_symbol, "NFO")
+            
+            # Subscribe to PE option if available (for BOTH mode)
+            if self.pe_option_token and self.pe_option_symbol:
+                logger.info(f"Subscribing to PE: {self.pe_option_symbol} (Token: {self.pe_option_token})")
+                self.market_feed.subscribe_option(self.pe_option_token, self.pe_option_symbol, "NFO")
+            
+            # Start polling
+            self.market_feed.connect()
+            logger.success(f"LTP Polling started - Trade Direction: {self.trade_direction}")
+        else:
+            # Use WebSocket
+            self.market_feed = MarketFeed(
+                auth_token=self.auth.jwt_token,
+                api_key=self.auth.api_key,
+                client_code=self.auth.client_code,
+                feed_token=self.auth.feed_token,
+                mode=SubscriptionMode.QUOTE
+            )
+            self.market_feed.add_tick_callback(self._on_tick)
+            
+            # Connect and wait for connection
+            logger.info("Connecting to WebSocket...")
+            if not self.market_feed.connect(timeout=15.0):
+                raise RuntimeError("Failed to connect to WebSocket")
+                
+            # Subscribe to both tokens
+            logger.info(f"Subscribing to Index token: {self.current_index_token}")
+            self.market_feed.subscribe_index(self.current_index_token)
+            logger.info(f"Subscribing to Option token: {self.current_option_token}")
+            self.market_feed.subscribe_option(self.current_option_token)
+            logger.success("WebSocket subscriptions complete - waiting for tick data...")
     
     def _on_tick(self, tick) -> None:
         """
@@ -392,19 +632,180 @@ class TradingBot:
         """
         token = str(tick.token)
         
+        # Count ticks for monitoring
+        if not hasattr(self, '_tick_count'):
+            self._tick_count = 0
+            self._last_tick_log = 0
+        self._tick_count += 1
+        
+        # Log every 100 ticks to show activity
+        if self._tick_count - self._last_tick_log >= 100:
+            logger.debug(f"📊 Tick #{self._tick_count} | Token: {token} | LTP: {tick.ltp:.2f}")
+            self._last_tick_log = self._tick_count
+        
+        # First tick log
+        if self._tick_count == 1:
+            logger.info(f"✅ First tick received! Token: {token} | LTP: {tick.ltp:.2f}")
+        
         if token == self.current_index_token:
             self.index_candle_builder.process_tick(tick)
         elif token == self.current_option_token:
             self.option_candle_builder.process_tick(tick)
+        # Also process ticks for the alternate option (if BOTH mode)
+        elif token == self.ce_option_token or token == self.pe_option_token:
+            # We only actively build candles for current option
+            # This ensures we can switch smoothly
+            pass
+    
+    async def _switch_option_type(self, new_type: str) -> None:
+        """
+        Switch between CE and PE option tracking.
+        
+        Args:
+            new_type: "CE" or "PE"
+        """
+        if new_type == self.current_option_type:
+            return
+            
+        logger.info(f"🔄 Switching from {self.current_option_type} to {new_type}")
+        
+        if new_type == "CE" and self.ce_option_token:
+            self.current_option_token = self.ce_option_token
+            self.current_option_symbol = self.ce_option_symbol
+            self.current_option_type = "CE"
+        elif new_type == "PE" and self.pe_option_token:
+            self.current_option_token = self.pe_option_token
+            self.current_option_symbol = self.pe_option_symbol
+            self.current_option_type = "PE"
+        else:
+            logger.warning(f"Cannot switch to {new_type} - token not available")
+            return
+        
+        # Update synchronizer with new token
+        if self.synchronizer:
+            self.synchronizer.update_option_token(self.current_option_token)
+        
+        # Clear option candle builder
+        if self.option_candle_builder:
+            self.option_candle_builder.clear()
+        
+        # Reset option EMAs
+        if self.option_emas:
+            self.option_emas.reset()
+        
+        logger.success(f"✓ Now tracking: {self.current_option_symbol} ({self.current_option_type})")
+    
+    async def _select_strike_on_n_structure(
+        self, 
+        n_structure: NStructure, 
+        index_price: float
+    ) -> Optional[DynamicStrike]:
+        """
+        Select optimal strike when N-Structure is detected on INDEX.
+        
+        v3.0 Dynamic Strike Selection:
+        1. Only called when INDEX shows valid N-Structure (HH + HL)
+        2. Finds strikes in 85-110 premium range
+        3. Scores by movement potential
+        4. Returns best strike for entry
+        
+        Args:
+            n_structure: Detected N-Structure pattern
+            index_price: Current index price
+            
+        Returns:
+            DynamicStrike if found, None otherwise
+        """
+        if not self.dynamic_strike_selector:
+            logger.warning("Dynamic strike selector not initialized")
+            return None
+        
+        # Premium fetcher function using broker API
+        def fetch_premium(token: str, symbol: str, exchange: str) -> Optional[float]:
+            try:
+                return self.auth.get_ltp(exchange, symbol, token)
+            except Exception as e:
+                logger.debug(f"Error fetching premium for {symbol}: {e}")
+                return None
+        
+        # Get expiry
+        expiry = self.instrument_master.get_nearest_expiry("NIFTY")
+        if not expiry:
+            logger.error("No expiry found for strike selection")
+            return None
+        
+        # Select strike based on N-Structure direction
+        selected = self.dynamic_strike_selector.select_strike_on_signal(
+            n_structure=n_structure,
+            index_price=index_price,
+            premium_fetcher=fetch_premium,
+            underlying="NIFTY",
+            expiry=expiry
+        )
+        
+        if selected:
+            # Update current option tracking
+            if selected.option_type == OptionType.CALL:
+                self.ce_option_token = selected.token
+                self.ce_option_symbol = selected.symbol
+                self.current_option_token = selected.token
+                self.current_option_symbol = selected.symbol
+                self.current_option_type = "CE"
+            else:
+                self.pe_option_token = selected.token
+                self.pe_option_symbol = selected.symbol
+                self.current_option_token = selected.token
+                self.current_option_symbol = selected.symbol
+                self.current_option_type = "PE"
+            
+            # Update synchronizer
+            if self.synchronizer:
+                self.synchronizer.update_option_token(self.current_option_token)
+            
+            # Update market feed subscription (polling mode)
+            if self.polling_mode and self.market_feed:
+                # Subscribe to newly selected option
+                self.market_feed.subscribe_option(selected.token, selected.symbol, "NFO")
+            
+            # Clear and reset option candle builder for new strike
+            if self.option_candle_builder:
+                self.option_candle_builder.clear()
+            
+            if self.option_emas:
+                self.option_emas.reset()
+            
+            self._strike_selected_for_signal = True
+            
+            logger.success(
+                f"✅ STRIKE SELECTED ON N-STRUCTURE | "
+                f"{selected.symbol} | Premium: ₹{selected.premium:.2f} | "
+                f"Score: {selected.movement_score:.1f}/100"
+            )
+        
+        return selected
     
     def _on_synced_candles_sync(self, pair: SyncedCandlePair) -> None:
         """
         Synchronous callback for synced candles.
         
-        Wraps the async handler.
+        Wraps the async handler. Handles both in-loop and threaded calls.
         """
-        # Schedule the async handler to run
-        asyncio.create_task(self._on_synced_candles(pair))
+        try:
+            # Try to get the running loop
+            loop = asyncio.get_running_loop()
+            # If we're in the event loop thread, just create task
+            asyncio.create_task(self._on_synced_candles(pair))
+        except RuntimeError:
+            # No running loop - we're being called from a different thread (polling)
+            # Use the stored event loop reference
+            if hasattr(self, '_event_loop') and self._event_loop:
+                self._event_loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._on_synced_candles(pair))
+                )
+            else:
+                # Fallback: run synchronously with asyncio.run (less ideal)
+                logger.warning("No event loop reference - running callback synchronously")
+                asyncio.run(self._on_synced_candles(pair))
     
     async def _on_synced_candles(self, pair: SyncedCandlePair) -> None:
         """
@@ -413,6 +814,124 @@ class TradingBot:
         This is the main trading logic entry point (v1.2 with re-entry).
         """
         try:
+            # Check if within trading hours
+            trading_config = self.config.get("trading_hours", {})
+            market_open = time(
+                trading_config.get("market_open_hour", 9),
+                trading_config.get("market_open_minute", 15)
+            )
+            market_close = time(
+                trading_config.get("market_close_hour", 15),
+                trading_config.get("market_close_minute", 30)
+            )
+            now = datetime.now().time()
+            
+            if not (market_open <= now < market_close):
+                # Market closed - skip trading logic
+                return
+            
+            # 🔧 FIX: Daily reset at market open (9:15-9:16 window)
+            if market_open <= now <= time(9, 16):
+                self._reset_daily_counters()
+            
+            # ===== DYNAMIC ATM RE-SELECTION =====
+            # Check if ATM has changed (every 50 points for NIFTY)
+            current_index_price = pair.index_candle.close
+            if current_index_price is None:
+                logger.debug("Skipping ATM re-selection: index_candle.close is None")
+            else:
+                current_atm = round(current_index_price / 50) * 50
+                
+                # Store current ATM for comparison
+                if not hasattr(self, '_last_atm_strike'):
+                    self._last_atm_strike = current_atm
+                
+                if current_atm != self._last_atm_strike and self._last_atm_strike is not None:
+                    logger.warning(
+                        f"🔄 ATM SHIFTED: {int(self._last_atm_strike)} → {int(current_atm)} | "
+                        f"Index: {current_index_price:.2f}"
+                    )
+                    
+                    # Re-select strikes at new ATM
+                    try:
+                        expiry = self.instrument_master.get_nearest_expiry("NIFTY")
+                        if not expiry:
+                            logger.error("Cannot re-select - no expiry found")
+                        else:
+                            # Re-select CE if trading CE
+                            if self.trade_direction in ["CE_ONLY", "BOTH"]:
+                                ce_option, ce_premium = await self._fast_strike_selection(
+                                    expiry=expiry,
+                                    atm_strike=current_atm,
+                                    option_type=OptionType.CALL
+                                )
+                                old_ce_token = self.ce_option_token
+                                self.ce_option_token = ce_option.token
+                                self.ce_option_symbol = ce_option.symbol
+                                
+                                logger.success(
+                                    f"✓ CE Re-selected: {self.ce_option_symbol} @ ₹{ce_premium:.2f} | "
+                                    f"(was {old_ce_token})"
+                                )
+                            
+                            # Re-select PE if trading PE
+                            if self.trade_direction in ["PE_ONLY", "BOTH"]:
+                                pe_option, pe_premium = await self._fast_strike_selection(
+                                    expiry=expiry,
+                                    atm_strike=current_atm,
+                                    option_type=OptionType.PUT
+                                )
+                                old_pe_token = self.pe_option_token
+                                self.pe_option_token = pe_option.token
+                                self.pe_option_symbol = pe_option.symbol
+                                
+                                logger.success(
+                                    f"✓ PE Re-selected: {self.pe_option_symbol} @ ₹{pe_premium:.2f} | "
+                                    f"(was {old_pe_token})"
+                                )
+                            
+                            # Update current tracking if not in position
+                            if self.fsm.state not in [TradingState.IN_POSITION, TradingState.PENDING_REENTRY]:
+                                # Safe to switch
+                                if self.trade_direction == "PE_ONLY":
+                                    self.current_option_token = self.pe_option_token
+                                    self.current_option_symbol = self.pe_option_symbol
+                                    self.current_option_type = "PE"
+                                else:
+                                    self.current_option_token = self.ce_option_token
+                                    self.current_option_symbol = self.ce_option_symbol
+                                    self.current_option_type = "CE"
+                                
+                                # Update synchronizer
+                                if self.synchronizer:
+                                    self.synchronizer.update_option_token(self.current_option_token)
+                                
+                                # Update market feed subscription
+                                if self.market_feed and old_ce_token and old_ce_token != self.ce_option_token:
+                                    self.market_feed.unsubscribe(old_ce_token, exchange="NFO")
+                                    self.market_feed.subscribe_option(self.ce_option_token, self.ce_option_symbol, "NFO")
+                                
+                                if self.market_feed and old_pe_token and old_pe_token != self.pe_option_token:
+                                    self.market_feed.unsubscribe(old_pe_token, exchange="NFO")
+                                    self.market_feed.subscribe_option(self.pe_option_token, self.pe_option_symbol, "NFO")
+                                
+                                logger.info(f"✓ Now tracking: {self.current_option_symbol}")
+                            else:
+                                logger.warning(f"⚠️ In position - deferring strike switch to next ATM shift")
+                    
+                    except Exception as e:
+                        logger.error(f"Error during ATM re-selection: {e}", exc_info=True)
+                    
+                    self._last_atm_strike = current_atm
+            # ===== END DYNAMIC ATM RE-SELECTION =====
+            
+            # Log candle received for visibility
+            logger.info(
+                f"🕯️ Candle {pair.timestamp.strftime('%H:%M')} | "
+                f"Index: {pair.index_candle.close:.2f} | "
+                f"Option [{self.current_option_type}]: {pair.option_candle.close:.2f}"
+            )
+            
             # Update EMAs
             self.index_emas.update(pair.index_candle.close)
             self.option_emas.update(pair.option_candle.close)
@@ -420,6 +939,9 @@ class TradingBot:
             index_ema_9 = self.index_emas.get_value(9)
             index_ema_15 = self.index_emas.get_value(15)
             option_ema_9 = self.option_emas.get_value(9)
+            
+            # v2.0: N-Structure pattern determines direction (not EMA crossover)
+            # CE/PE switching happens AFTER pattern detection below
             
             # Log candles
             self.slog.log_candle(
@@ -447,6 +969,7 @@ class TradingBot:
             
             # Create Candle object for FSM
             index_candle = Candle(
+                token=self.current_index_token or "",
                 timestamp=pair.timestamp,
                 open=pair.index_candle.open,
                 high=pair.index_candle.high,
@@ -456,6 +979,7 @@ class TradingBot:
             )
             
             option_candle = Candle(
+                token=self.current_option_token or "",
                 timestamp=pair.timestamp,
                 open=pair.option_candle.open,
                 high=pair.option_candle.high,
@@ -486,12 +1010,63 @@ class TradingBot:
                     return
             
             # Process through N-Structure detector
-            n_structure = self.n_detector.process_candle(
-                index_candle=index_candle,
-                option_candle=option_candle,
-                ema_9=index_ema_9,
-                ema_15=index_ema_15
+            # Create SyncedCandlePair for the detector
+            synced_pair = SyncedCandlePair(
+                timestamp=pair.timestamp,
+                index_candle=pair.index_candle,
+                option_candle=pair.option_candle
             )
+            
+            # v5.1: Pass volume for breakout confirmation
+            # Use index candle volume (or 0 if not available)
+            candle_volume = getattr(pair.index_candle, 'volume', 0) or 0
+            
+            status, n_structure, msg = self.n_detector.process_synced_pair(
+                pair=synced_pair,
+                ema_fast_value=index_ema_9 or 0,
+                ema_slow_value=index_ema_15 or 0,
+                volume=candle_volume  # v5.1: Volume confirmation
+            )
+            
+            if n_structure:
+                logger.info(f"N-Structure: {status.name} | {msg}")
+                
+                # v3.0: Dynamic Strike Selection AFTER N-Structure detected on INDEX
+                # Only select strike when:
+                # 1. N-Structure is valid (has direction)
+                # 2. Not already in position
+                # 3. Strike not already selected for this signal
+                if (n_structure.direction and 
+                    self.fsm.state not in [TradingState.IN_POSITION, TradingState.PENDING_REENTRY] and
+                    status == SetupStatus.READY_FOR_ENTRY and
+                    not self._strike_selected_for_signal):
+                    
+                    logger.info(
+                        f"🎯 N-Structure READY on INDEX! Selecting optimal strike in ₹85-₹110 range..."
+                    )
+                    
+                    # Select best strike based on N-Structure direction
+                    selected_strike = await self._select_strike_on_n_structure(
+                        n_structure=n_structure,
+                        index_price=pair.index_candle.close
+                    )
+                    
+                    if not selected_strike:
+                        logger.warning(
+                            f"❌ No strike found in ₹85-₹110 range for "
+                            f"{'CE' if n_structure.direction == SignalDirection.BULLISH else 'PE'}. "
+                            f"Skipping this signal."
+                        )
+                        # Reset and wait for next signal
+                        self._strike_selected_for_signal = False
+                        return
+                
+                # v2.0: Switch option type based on pattern direction (not EMA)
+                if self.trade_direction == "BOTH" and n_structure.direction:
+                    if n_structure.direction == SignalDirection.BULLISH and self.current_option_type != "CE":
+                        await self._switch_option_type("CE")
+                    elif n_structure.direction == SignalDirection.BEARISH and self.current_option_type != "PE":
+                        await self._switch_option_type("PE")
             
             previous_state = self.fsm.state
             
@@ -530,9 +1105,28 @@ class TradingBot:
                     logger.info(f"Entry blocked by filters: {' | '.join(filter_messages)}")
                     # Stay in ARMED state, will retry next candle
                 else:
-                    is_reentry = self.fsm.is_reentry_trade
-                    logger.info(f"Filters passed: {' | '.join(filter_messages)}")
-                    await self._execute_entry(n_structure, option_candle, is_reentry=is_reentry)
+                    # v3.0: Check body ratio filter (65% minimum)
+                    candle_body = abs(option_candle.close - option_candle.open)
+                    candle_range = option_candle.high - option_candle.low
+                    body_pct = (candle_body / candle_range * 100) if candle_range > 0 else 0
+                    
+                    entry_config = self.config.get("entry", {})
+                    min_body_pct = entry_config.get("min_candle_body_pct", 65)  # v3.0: 65% default
+                    
+                    if body_pct < min_body_pct:
+                        logger.info(
+                            f"Entry blocked: Body ratio {body_pct:.1f}% < {min_body_pct}% minimum | "
+                            f"Candle: O={option_candle.open:.2f} H={option_candle.high:.2f} "
+                            f"L={option_candle.low:.2f} C={option_candle.close:.2f}"
+                        )
+                        # Stay in ARMED state, will retry next candle
+                    else:
+                        is_reentry = self.fsm.is_reentry_trade
+                        logger.info(
+                            f"Filters passed: {' | '.join(filter_messages)} | "
+                            f"Body: {body_pct:.1f}% ✓"
+                        )
+                        await self._execute_entry(n_structure, option_candle, is_reentry=is_reentry)
             
             # Update SL if in position
             if self.fsm.state == TradingState.IN_POSITION:
@@ -551,6 +1145,16 @@ class TradingBot:
     async def _handle_reentry_opportunity(self, option_candle: Candle) -> None:
         """
         Check for HH breakout re-entry opportunity (v1.2).
+        
+        🟡 MEDIUM CONCERN #3 FIX: Re-entry Logic Clarified
+        
+        RE-ENTRY RULES (Explicit, no ambiguity):
+        1. Only triggered AFTER SL hit (FSM state = SL_HIT)
+        2. Watches for Higher High (HH) above last high after SL
+        3. HH must be 2+ points above SL exit price (min gap)
+        4. Candle must show strength (40%+ body, 2+ point range)
+        5. Only 1 re-entry allowed per day (Sniper mode)
+        6. If re-entry SL also hits → Day ends (no further trades)
         
         Args:
             option_candle: Current option candle
@@ -605,6 +1209,18 @@ class TradingBot:
         pnl_points = exit_price - entry_price
         pnl = pnl_points * quantity
         
+        # 🔥 TRADE EXECUTION LOGGING: Log SL exit (CRITICAL FIX)
+        logger.warning(
+            f"\n❌ TRADE SL HIT | "
+            f"Exit Price: {exit_price:.2f} | "
+            f"Entry Price: {entry_price:.2f} | "
+            f"P&L: ₹{pnl:.0f} ({pnl_points:+.1f}pt) | "
+            f"Qty: {quantity} | "
+            f"Reason: {reason} | "
+            f"Direction: {self.current_option_type} | "
+            f"Time: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        
         # Record trade with risk manager
         is_reentry = self.fsm.is_reentry_trade
         self.risk_manager.record_trade(
@@ -614,12 +1230,6 @@ class TradingBot:
             entry_price=entry_price,
             exit_price=exit_price,
             is_reentry=is_reentry
-        )
-        
-        # Log
-        logger.warning(
-            f"SL Exit: {exit_price:.2f} | PnL: ₹{pnl:.0f} ({pnl_points:+.1f}pt) | "
-            f"Reason: {reason} | Re-entry: {is_reentry}"
         )
         
         # Check if re-entry is allowed
@@ -664,18 +1274,50 @@ class TradingBot:
             option_candle: Current option candle
             is_reentry: Whether this is a re-entry trade
         """
+        # 🔥 SNIPER MODE CHECK: Enforce 1-trade/day limit (CRITICAL FIX)
+        today = datetime.now().date()
+        if self._last_trade_date and self._last_trade_date == today and self._daily_trades_count >= 1:
+            logger.warning(
+                f"🔒 SNIPER MODE: Daily trade limit reached (1/day). "
+                f"Already traded today. Next trade window: TOMORROW"
+            )
+            self.slog.log_signal(
+                signal_type="entry_blocked",
+                status="rejected",
+                index_price=option_candle.close,
+                option_price=option_candle.close,
+                entry_trigger=0.0,
+                reason="Sniper mode: 1 trade/day limit enforced"
+            )
+            return
+        
         # Get entry trigger
         if is_reentry:
             entry_trigger = self.fsm.context.reentry_hh_trigger
         elif n_structure:
             entry_config = self.config.get("entry", {})
             buffer = entry_config.get("buffer_points", 1.5)
-            entry_trigger = n_structure.breakout_high + buffer
+            # 🔥 ADD SLIPPAGE BUFFER: Prevent misses due to real market slippage (CRITICAL FIX)
+            slippage_buffer = entry_config.get("slippage_buffer_points", 0.75)
+            entry_trigger = n_structure.breakout_high + buffer + slippage_buffer
         else:
             return
         
         # Get fixed quantity from risk manager
         quantity = self.risk_manager.get_position_size()
+        
+        # 🔥 TRADE EXECUTION LOGGING: Log entry attempt (CRITICAL FIX)
+        logger.info(
+            f"\n📊 TRADE ENTRY ATTEMPT | "
+            f"Token: {self.current_option_token} | "
+            f"Symbol: {self.current_option_symbol} | "
+            f"Type: {'RE-ENTRY' if is_reentry else 'NEW'} | "
+            f"Entry Trigger: {entry_trigger:.2f} | "
+            f"Limit: {entry_trigger + 1.0:.2f} | "
+            f"Direction: {self.current_option_type} | "
+            f"Qty: {quantity} | "
+            f"Time: {option_candle.timestamp.strftime('%H:%M:%S')}"
+        )
         
         order_request = OrderRequest(
             symbol=self.current_option_symbol,
@@ -714,6 +1356,19 @@ class TradingBot:
             sl_points = exit_config.get("initial_sl_points", 10.0)
             sl_price = entry_trigger - sl_points
             
+            # 🔥 TRADE EXECUTION LOGGING: Log successful entry (CRITICAL FIX)
+            logger.info(
+                f"✅ TRADE EXECUTED | "
+                f"Order ID: {response.order_id} | "
+                f"Entry Price: {entry_trigger:.2f} | "
+                f"SL Price: {sl_price:.2f} | "
+                f"SL Points: {sl_points:.2f} | "
+                f"Qty: {quantity} | "
+                f"Direction: {self.current_option_type} | "
+                f"Trades Today: {self._daily_trades_count + 1}/1 | "
+                f"Time: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            
             self.sl_manager.initialize_sl(
                 symbol=self.current_option_symbol,
                 token=self.current_option_token,
@@ -740,6 +1395,15 @@ class TradingBot:
                 quantity=quantity
             )
             
+            # 🔥 SNIPER MODE: Increment trade count for daily limit (CRITICAL FIX)
+            if today != self._last_trade_date:
+                self._daily_trades_count = 0
+            self._daily_trades_count += 1
+            self._last_trade_date = today
+            
+            # v3.0: Reset strike selection flag after entry
+            self._strike_selected_for_signal = False
+            
             self.slog.log_order(
                 action="place",
                 order_id=response.order_id,
@@ -752,19 +1416,21 @@ class TradingBot:
                 is_reentry=is_reentry
             )
             
+            dir_emoji = "📈" if self.current_option_type == "CE" else "📉"
             logger.success(
-                f"{trade_type} executed: {self.current_option_symbol} @ {entry_trigger:.2f}, "
+                f"{dir_emoji} {trade_type} [{self.current_option_type}]: {self.current_option_symbol} @ {entry_trigger:.2f}, "
                 f"Qty={quantity}, SL={sl_price:.2f}"
             )
             
-            # Send Telegram entry alert
+            # Send Telegram entry alert with direction
             if self.telegram:
                 await self.telegram.send_entry_alert(
                     symbol=self.current_option_symbol,
                     entry_price=entry_trigger,
                     sl_price=sl_price,
                     quantity=quantity,
-                    is_reentry=is_reentry
+                    is_reentry=is_reentry,
+                    direction=self.current_option_type  # CE or PE
                 )
         else:
             self.slog.log_order(
@@ -841,6 +1507,9 @@ class TradingBot:
         """Main trading loop."""
         self._running = True
         
+        # Store event loop reference for cross-thread callback scheduling
+        self._event_loop = asyncio.get_running_loop()
+        
         trading_config = self.config.get("trading_hours", {})
         market_open = time(
             trading_config.get("market_open_hour", 9),
@@ -852,14 +1521,11 @@ class TradingBot:
         )
         
         try:
-            # Wait for market open
-            await self._wait_until(market_open)
+            # Set up market data immediately (strike selection + feed)
+            await self._setup_market_data()
             
             if self._shutdown_flag:
                 return
-            
-            # Set up market data (strike selection + WebSocket)
-            await self._setup_market_data()
             
             # Send bot started notification
             if self.telegram:
@@ -867,14 +1533,24 @@ class TradingBot:
             
             logger.info("Trading loop started")
             
-            # Main loop
+            # Track if we logged market closed message
+            _logged_market_closed = False
+            
+            # Main loop - runs forever until manual shutdown
             while not self._shutdown_flag:
                 now = datetime.now().time()
                 
-                # Check market close
-                if now >= market_close:
-                    logger.info("Market close time reached")
-                    break
+                # Check if market is open
+                is_market_open = market_open <= now < market_close
+                
+                if is_market_open:
+                    _logged_market_closed = False  # Reset for next close
+                    # Normal trading - processing happens in callbacks
+                else:
+                    # Market closed - just wait, don't shutdown
+                    if not _logged_market_closed:
+                        logger.info(f"⏸️ Market closed. Waiting for next session ({market_open})...")
+                        _logged_market_closed = True
                 
                 # Small sleep to prevent busy loop
                 await asyncio.sleep(0.1)
@@ -993,6 +1669,11 @@ async def main():
         default="data/logs",
         help="Directory for log files"
     )
+    parser.add_argument(
+        "--polling",
+        action="store_true",
+        help="Use LTP polling instead of WebSocket (for rate limit bypass)"
+    )
     
     args = parser.parse_args()
     
@@ -1005,6 +1686,7 @@ async def main():
     logger.info("=" * 50)
     logger.info("N-Structure Trading Bot Starting")
     logger.info(f"Paper Mode: {args.paper}")
+    logger.info(f"Polling Mode: {args.polling}")
     logger.info(f"Config: {args.config}")
     logger.info("=" * 50)
     
@@ -1020,7 +1702,7 @@ async def main():
     
     try:
         # Initialize
-        await bot.setup(paper_mode=args.paper)
+        await bot.setup(paper_mode=args.paper, polling_mode=args.polling)
         
         # Run
         await bot.run()

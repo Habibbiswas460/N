@@ -143,12 +143,20 @@ class MarketFeed:
         if SmartWebSocketV2 is None:
             logger.error("SmartApi WebSocket not installed")
             return
+        
+        logger.info(f"Creating WebSocket with client: {self.client_code}")
+        logger.debug(f"Auth token: {self.auth_token[:20]}...")
+        logger.debug(f"Feed token: {self.feed_token[:20]}...")
             
         self._ws = SmartWebSocketV2(
             self.auth_token,
             self.api_key,
             self.client_code,
-            self.feed_token
+            self.feed_token,
+            max_retry_attempt=5,  # Retry 5 times before giving up
+            retry_delay=2,         # Start with 2 second delay
+            retry_multiplier=2,    # Double delay each time
+            retry_duration=30      # Max 30 seconds total retry time
         )
         
         # Assign callbacks
@@ -177,6 +185,7 @@ class MarketFeed:
     def _on_data(self, wsapp, message: dict) -> None:
         """Handle incoming tick data."""
         try:
+            logger.debug(f"📥 Raw WS data: {str(message)[:200]}")
             tick = TickData.from_websocket_data(message)
             
             # Store latest tick
@@ -250,7 +259,7 @@ class MarketFeed:
     ) -> None:
         """Internal subscribe implementation."""
         if not self._ws or not self._is_connected:
-            logger.warning("Cannot subscribe - not connected")
+            logger.warning(f"Cannot subscribe - not connected (ws={self._ws is not None}, connected={self._is_connected})")
             return
             
         mode = mode or self.default_mode
@@ -263,24 +272,40 @@ class MarketFeed:
             }
         ]
         
+        logger.info(f"🔔 Subscribing: {tokens} on {exchange_type.name} (mode={mode})")
+        
         try:
             self._ws.subscribe(correlation_id, mode, token_list)
-            logger.debug(f"Subscribed to {len(tokens)} tokens on {exchange_type.name}")
+            logger.success(f"✅ Subscribed to {len(tokens)} tokens on {exchange_type.name}")
         except Exception as e:
             logger.error(f"Subscribe error: {e}")
             
-    def connect(self) -> bool:
+    def connect(self, timeout: float = 10.0) -> bool:
         """
-        Connect to WebSocket.
+        Connect to WebSocket and wait for connection.
         
+        Args:
+            timeout: Max seconds to wait for connection
+            
         Returns:
-            True if connection initiated successfully
+            True if connected successfully
         """
         try:
             self._create_websocket()
             if self._ws:
                 self._ws.connect()
-                return True
+                
+                # Wait for connection to be established
+                start_time = time.time()
+                while not self._is_connected and (time.time() - start_time) < timeout:
+                    time.sleep(0.1)
+                    
+                if self._is_connected:
+                    logger.info(f"WebSocket connected in {time.time() - start_time:.1f}s")
+                    return True
+                else:
+                    logger.error(f"WebSocket connection timeout after {timeout}s")
+                    return False
         except Exception as e:
             logger.error(f"Connection failed: {e}")
         return False

@@ -1,264 +1,224 @@
-# N-Structure Algorithmic Trading Bot v1.2
+# N-Structure Algorithmic Trading Bot v5.2
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Status: Production](https://img.shields.io/badge/Status-Production-green.svg)]()
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Status: Production Ready](https://img.shields.io/badge/Status-Production_Ready-green.svg)]()
+[![Tests: 98 Passing](https://img.shields.io/badge/Tests-98_Passing-success.svg)]()
 
-A dual-chart (Index + Option) algorithmic trading system implementing the N-Structure Momentum Breakout strategy for NIFTY options via Angel One SmartAPI.
+A dual-chart (Index + Option) algorithmic trading system implementing the **N-Structure Ultimate Sniper** strategy for NIFTY options via Angel One SmartAPI.
 
 > ⚠️ **Private Repository** - For personal use only. Not for redistribution.
 
-## 🚀 Strategy Overview
+---
 
-The N-Structure strategy identifies high-probability breakout entries using:
+## 🎯 Strategy Overview
 
-1. **EMA Support**: Price trading above EMA(9) and EMA(15)
-2. **N-Structure Pattern**: Breakout → Pullback (HL1) → Higher Low (HL2)
-3. **Divergence Filter**: Option ROC must confirm Index momentum
-4. **Structure-Based TSL**: Trail to swing lows, not just candle lows
-5. **Composite Filters**: Volume + Trend + Time filters (v1.2)
+```
+INDEX Chart           OPTION Chart
+    ▲                      ▲
+   /│\  HH (Higher High)  /│\  Entry Point
+  / │ \                  / │ \
+ /  │  \  ← Pullback    /  │  \
+HL2 HL1  ← Confirmation ────────────→ BUY!
+```
 
-## 📊 Backtest Results (90 Days - v1.2)
+**N-Structure Pattern Detection:**
+1. **HH+HL Formation** - Higher High followed by Higher Lows
+2. **Confirmation Candle** - Wait 2 candles after pattern (v5.2)
+3. **Volume Breakout** - 1.5x average volume required
+4. **Gap Filter** - Skip signals on 50+ point gap days
 
-| Metric | Value |
-|--------|-------|
-| Total Trades | 117 |
-| Win Rate | 54.7% |
-| Total P&L | **₹48,244** |
-| Profit Factor | 1.39 |
-| Max Drawdown | ₹6,800 |
-| Avg Win | ₹1,480 |
-| Avg Loss | ₹1,880 |
-| Sharpe Ratio | 1.82 |
+---
 
-## ✨ Key Features (v1.2)
+## 🔥 Features (v5.2)
 
-### Position Sizing
-- **Fixed 4 Lots**: 65 qty × 4 = 260 qty per trade
-- **Fixed SL**: 10 points (₹2,600 risk per trade)
-- **Max Daily Loss**: 3 SL hits = ₹7,800 max
+| Feature | Description |
+|---------|-------------|
+| **Confirmation Candle** | Wait 2 candles after pattern - avoid early entries |
+| **Volume Filter** | Breakout volume must be 1.5x average |
+| **Gap Filter** | Skip first signal on large gap days (>50pt) |
+| **Sniper Mode** | 1 SL/day = Day Over (capital protection) |
+| **Structure TSL** | Trail to swing lows, not just candle lows |
+| **Dynamic Strike** | Select strike AFTER N-Structure confirmed |
 
-### Structure-Based TSL (v1.1)
-- **Phase 1**: Initial SL at Entry - 10 points
-- **Phase 2**: Breakeven at +8 points profit
-- **Phase 3**: Structure TSL - Trail to HL[-2] minus 2.5pt buffer
-- **Phase 4**: Tight Trail at +20 points - Use 1.5pt buffer
-- **SL Breath Rule**: Allow 1 candle to breach if structure intact
+---
 
-### HH Breakout Re-entry (v1.2)
-- After SL hit, watch for new Higher High breakout
-- Re-enter on HH + 1.5pt buffer
-- Max 2 re-entries per day
-- Recovers ~42% more profit from losing setups
+## 📊 Position Sizing Profiles
 
-### Risk Management
-- **ONLY Limiter**: Max 3 SL hits per day
-- NO daily loss % limit
-- NO consecutive loss limit
-- NO max trades limit
-- Unlimited profitable trades!
+| Mode | Lots | Qty | Risk/Trade | Daily Loss | Capital |
+|------|------|-----|------------|------------|---------|
+| 🟢 Conservative | 4 | 260 | ₹1,300 | ₹1,300 | ₹30K |
+| 🟡 **Moderate** | 6 | 390 | ₹1,950 | ₹1,950 | ₹50K |
+| 🔴 Aggressive | 8 | 520 | ₹2,600 | ₹2,600 | ₹75K |
+| 🔥 Ultra | 12 | 780 | ₹3,900 | ₹3,900 | ₹1L+ |
+
+**Change in `config/settings.yaml`:**
+```yaml
+risk:
+  position_mode: "moderate"  # conservative | moderate | aggressive | ultra
+```
+
+---
 
 ## 🏗️ Project Structure
 
 ```
 N/
-├── config/
-│   └── settings.yaml          # Strategy configuration (v1.2)
-├── src/
-│   ├── main.py                # Main trading bot orchestrator
-│   ├── backtest/
-│   │   ├── backtester_v2.py   # FSM-based backtester with re-entry
-│   │   └── historical_data.py # API data fetcher with pagination
-│   ├── broker/
-│   │   └── auth.py            # Angel One authentication
-│   ├── core/
-│   │   ├── state_machine.py   # Trading FSM (v1.2 with PENDING_REENTRY)
-│   │   └── state_store.py     # SQLite persistence
-│   ├── data/
-│   │   ├── candle_builder.py  # 1-min OHLC aggregation
-│   │   ├── instrument_master.py # Daily instrument file
-│   │   ├── market_feed.py     # WebSocket data feed
-│   │   └── synchronizer.py    # Index-Option sync
-│   ├── execution/
-│   │   ├── order_manager.py   # Order placement
-│   │   └── sl_manager.py      # Structure-based TSL (v1.1)
-│   ├── indicators/
-│   │   ├── ema.py             # Incremental EMA
-│   │   └── n_structure.py     # Pattern detection
-│   ├── risk/
-│   │   ├── risk_manager.py    # Max SL only limiter (v1.2)
-│   │   └── position_reconciler.py
-│   └── utils/
-│       └── logger.py          # Structured logging
-├── tests/
-│   ├── test_sl_manager.py     # SL manager tests
-│   ├── test_risk_manager.py   # Risk manager tests
-│   └── test_state_machine.py  # FSM tests
-├── docs/
-│   └── RISK_MANAGEMENT.md     # Risk management documentation
-├── run_backtest_v2.py         # Backtest runner
-└── requirements.txt
+├── 📁 config/
+│   └── settings.yaml           # All strategy parameters
+│
+├── 📁 src/                     # Source code
+│   ├── main.py                 # Main trading bot
+│   ├── backtest/               # Backtesting engine
+│   ├── broker/                 # Angel One API
+│   ├── core/                   # State machine & storage
+│   ├── data/                   # Market data handling
+│   ├── execution/              # Order & SL management
+│   ├── indicators/             # EMA, N-Structure, Filters
+│   ├── risk/                   # Risk Manager v2.0
+│   ├── strategies/             # Strategy implementations
+│   └── utils/                  # Logging, Telegram
+│
+├── 📁 scripts/
+│   ├── backtest/               # All backtest scripts
+│   ├── paper_trade.py          # Paper trading script
+│   ├── start_live.sh           # Start live trading
+│   └── start_paper.sh          # Start paper trading
+│
+├── 📁 tests/                   # 98 unit tests
+│   ├── test_filters.py
+│   ├── test_risk_manager.py
+│   ├── test_sl_manager.py
+│   └── test_state_machine.py
+│
+├── 📁 docs/
+│   ├── LIVE_TRADING_CHECKLIST.md
+│   ├── RISK_MANAGEMENT.md
+│   ├── archive/                # Old session docs
+│   └── research/               # Strategy research
+│
+├── 📁 data/
+│   ├── cache/                  # Instrument cache
+│   └── instruments/            # Daily instrument files
+│
+├── 📁 logs/                    # Daily trading logs
+│
+├── .env                        # API credentials (not in git)
+├── .env.example                # Credential template
+├── requirements.txt            # Python dependencies
+└── README.md                   # This file
 ```
-
-## 🔧 Quick Start
-
-```bash
-# Clone repository (private)
-git clone git@github.com:yourusername/N.git
-cd N
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your Angel One credentials
-```
-
-## ⚙️ Configuration
-
-Edit `config/settings.yaml`:
-
-```yaml
-# Key settings (v1.2 optimized)
-risk:
-  lot_size: 65              # NIFTY lot
-  num_lots: 4               # Always 4 lots
-  max_sl_per_day: 3         # ONLY limiter!
-
-exit:
-  initial_sl_points: 10.0   # 10pt SL
-  trailing:
-    breakeven_trigger_points: 8.0   # BE at +8
-    structure_tsl:
-      tsl_buffer: 2.5       # Buffer below HL
-    tight_trail:
-      trigger_points: 20.0  # Tight at +20
-
-reentry:
-  enabled: true
-  max_reentries_per_day: 2
-```
-
-## 🚀 Usage
-
-### Paper Trading (Test First!)
-```bash
-./scripts/start_paper.sh
-# or
-python src/main.py --paper
-```
-
-### Live Trading
-```bash
-./scripts/start_live.sh
-# or
-python src/main.py
-```
-
-### Run Backtest
-```bash
-python run_backtest_v2.py --days 90
-```
-
-### Run Tests
-```bash
-pytest tests/ -v
-```
-
-## 📁 Project Structure
-
-```
-N/
-├── config/
-│   └── settings.yaml          # Strategy configuration
-├── scripts/
-│   ├── start_paper.sh         # Paper mode launcher
-│   └── start_live.sh          # Live mode launcher
-├── src/
-│   ├── main.py                # Main trading bot
-│   ├── backtest/              # Backtesting engine
-│   ├── broker/                # Angel One integration
-│   ├── core/                  # FSM & state management
-│   ├── data/                  # Market data handling
-│   ├── execution/             # Order & SL management
-│   ├── indicators/            # EMA, N-Structure
-│   ├── risk/                  # Risk management
-│   └── utils/                 # Logging utilities
-├── tests/                     # Unit tests
-├── docs/                      # Documentation
-└── data/                      # Logs & cache
-```
-
-## 📋 Risk Parameters
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Lot Size | 65 qty | NIFTY lot size |
-| Num Lots | 4 | Fixed position |
-| Total Qty | 260 | 65 × 4 |
-| SL Points | 10 | Fixed stop loss |
-| Risk/Trade | ₹2,600 | 10 × 260 |
-| Max SL/Day | 3 | Only limiter |
-| Max Loss/Day | ₹7,800 | 3 × ₹2,600 |
-| Max Re-entries | 2 | Per day |
-
-## 🔄 TSL Phases
-
-| Phase | Trigger | SL Level | Buffer |
-|-------|---------|----------|--------|
-| Initial | Entry | Entry - 10pt | - |
-| Breakeven | +8pt profit | Entry price | - |
-| Structure | 2+ HLs | HL[-2] | 2.5pt |
-| Tight | +20pt profit | HL[-2] | 1.5pt |
-
-## 📝 Environment Variables
-
-```env
-ANGEL_API_KEY=your_api_key
-ANGEL_CLIENT_CODE=your_client_code
-ANGEL_PASSWORD=your_password
-ANGEL_TOTP_SECRET=your_totp_secret
-```
-
-## 🧪 Testing
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Run specific test file
-pytest tests/test_sl_manager.py -v
-
-# Run with coverage
-pytest tests/ --cov=src --cov-report=html
-```
-
-## 📚 Documentation
-
-- [Live Trading Checklist](docs/LIVE_TRADING_CHECKLIST.md) - Pre-deployment checklist
-- [Risk Management](docs/RISK_MANAGEMENT.md) - Risk management documentation
-
-## ⚠️ Disclaimer
-
-This is an algorithmic trading system for **personal use only**. 
-
-- Use at your own risk
-- Past performance does not guarantee future results
-- Always test thoroughly in paper mode before live trading
-- Never risk more than you can afford to lose
-
-## 📄 License
-
-Private - All rights reserved.
 
 ---
 
-**Version**: 1.2.0  
-**Last Updated**: January 2026  
-**Status**: Production Ready ✅
+## 🚀 Quick Start
+
+### 1. Setup Environment
+```bash
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# venv\Scripts\activate   # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 2. Configure Credentials
+```bash
+# Copy example and fill in your Angel One API credentials
+cp .env.example .env
+nano .env
+```
+
+### 3. Configure Strategy
+```bash
+# Edit config/settings.yaml
+# Set position_mode, trading times, etc.
+nano config/settings.yaml
+```
+
+### 4. Run Paper Trading
+```bash
+python src/main.py --paper --polling
+```
+
+### 5. Run Live Trading (after testing)
+```bash
+python src/main.py --polling
+```
+
+---
+
+## ⚙️ Key Configuration
+
+```yaml
+# config/settings.yaml
+
+strategy:
+  version: "5.2.0"
+
+indicators:
+  n_structure:
+    confirmation_candles: 2        # Wait 2 candles
+    require_direction_candle: true # Must be directional
+    volume_confirmation_enabled: true
+    gap_filter_enabled: true
+
+risk:
+  position_mode: "moderate"
+  max_sl_per_day: 1               # SNIPER MODE
+  sl_points: 5.0
+
+timing:
+  trading_start: "09:50"
+  no_new_trades_after: "12:30"
+  manage_till: "14:40"
+```
+
+---
+
+## 🧪 Run Tests
+
+```bash
+# All tests
+python -m pytest tests/ -v
+
+# Specific test file
+python -m pytest tests/test_risk_manager.py -v
+```
+
+---
+
+## 📈 Risk Management v2.0
+
+**Protection Layers (checked in order):**
+1. 🛑 **Emergency Halt** - Manual override
+2. ⏰ **Time Window** - No trades before 9:50 or after 12:30
+3. 🎯 **SNIPER MODE** - Max 1 SL hit per day
+4. 💰 **Daily Loss Limit** - Absolute ₹ limit
+5. 📉 **Capital Protection** - Max 5% loss
+6. 📊 **Max Trades** - Safety cap (10/day)
+7. ⏳ **Cooldown** - After each trade
+
+---
+
+## 📝 Version History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v5.2.0 | Feb 2026 | Confirmation Candle, Risk Manager v2.0 |
+| v5.1.0 | Feb 2026 | Volume Filter, Gap Filter |
+| v5.0.0 | Jan 2026 | Pullback Entry, Dual Direction |
+| v1.2.0 | Jan 2026 | HH Breakout Re-entry |
+| v1.1.0 | Jan 2026 | Structure-based TSL |
+| v1.0.0 | Jan 2026 | Initial release |
+
+---
+
+## ⚠️ Disclaimer
+
+This software is for educational purposes only. Trading involves significant risk of loss. Past performance does not guarantee future results. Use at your own risk.
+
+---
+
+**Made with ❤️ for algorithmic trading**

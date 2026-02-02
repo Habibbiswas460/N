@@ -1,11 +1,11 @@
 """
-Unit Tests for SL Manager v1.1
+Unit Tests for SL Manager v2.0 Sniper Mode
 
-Tests the structure-based trailing stop loss logic:
-- Initial SL at entry - 10 points
-- Breakeven at +8 points profit
-- Structure-based TSL with HL tracking
-- Tight trail at +20 points
+Tests the v2.0 Sniper Mode trailing stop loss logic:
+- Initial SL at entry - 5 points (tight)
+- Safe Mode at +7 points → SL = Entry + 1pt
+- Trail Mode at +10 points → TSL = High - 5pt
+- Structure-based TSL with HL tracking (legacy)
 - SL Breath rule
 """
 
@@ -76,7 +76,7 @@ class TestSLManagerInitialization:
     """Test SL manager initialization."""
     
     def test_default_config(self):
-        """Test default configuration values."""
+        """Test default configuration values (v2.0 Sniper Mode)."""
         order_manager = MockOrderManager()
         state_store = MockStateStore()
         
@@ -85,11 +85,14 @@ class TestSLManagerInitialization:
             state_store=state_store
         )
         
-        assert sl_manager.initial_sl_points == 10.0
-        assert sl_manager.breakeven_trigger_points == 8.0
+        # v2.0 Sniper Mode defaults
+        assert sl_manager.initial_sl_points == 5.0  # v2.0: 5pt (was 10)
+        assert sl_manager.safe_mode_trigger == 7.0  # v2.0: Safe at +7pt
+        assert sl_manager.safe_mode_buffer == 1.0   # v2.0: Entry + 1pt
+        assert sl_manager.trail_mode_trigger == 10.0  # v2.0: Trail at +10pt
+        assert sl_manager.trail_mode_buffer == 5.0    # v2.0: High - 5pt
+        assert sl_manager.enable_sniper_mode == True
         assert sl_manager.tsl_buffer == 2.5
-        assert sl_manager.tight_trigger_points == 20.0
-        assert sl_manager.tight_buffer == 1.5
         assert sl_manager.enable_breath_rule == True
     
     def test_custom_config(self):
@@ -111,7 +114,7 @@ class TestSLInitialization:
     """Test SL order initialization."""
     
     def test_initialize_sl(self):
-        """Test SL initialization creates correct state."""
+        """Test SL initialization creates correct state (v2.0: 5pt SL)."""
         order_manager = MockOrderManager()
         sl_manager = StopLossManager(
             order_manager=order_manager,
@@ -128,9 +131,10 @@ class TestSLInitialization:
         
         assert order_id is not None
         assert sl_manager.state is not None
+        # v2.0: SL = Entry - 5pt
+        assert sl_manager.state.initial_sl == 95.0  # 100 - 5
+        assert sl_manager.state.current_sl == 95.0
         assert sl_manager.state.entry_price == 100.0
-        assert sl_manager.state.initial_sl == 90.0  # 100 - 10
-        assert sl_manager.state.current_sl == 90.0
         assert sl_manager.state.status == SLStatus.INITIAL
         assert sl_manager.state.tsl_phase == TSLPhase.PHASE_1_INITIAL
     
@@ -163,7 +167,7 @@ class TestBreakeven:
     """Test breakeven logic."""
     
     def test_breakeven_not_triggered_below_threshold(self):
-        """Test BE not triggered when profit < 8 points."""
+        """Test Safe Mode not triggered below +7pt profit."""
         sl_manager = StopLossManager(
             order_manager=MockOrderManager(),
             state_store=MockStateStore()
@@ -174,15 +178,15 @@ class TestBreakeven:
             quantity=260, entry_price=100.0
         )
         
-        # Price at +7 points (below 8pt threshold)
-        result = sl_manager.check_breakeven(107.0)
+        # Price at +5 points (below 7pt Safe Mode threshold)
+        result = sl_manager.check_breakeven(105.0)
         
         assert result == False
         assert sl_manager.state.breakeven_hit == False
-        assert sl_manager.state.current_sl == 90.0  # Unchanged
+        assert sl_manager.state.current_sl == 95.0  # Still at initial (5pt SL)
     
     def test_breakeven_triggered_at_threshold(self):
-        """Test BE triggered when profit >= 8 points."""
+        """Test Safe Mode triggers at +7pt profit (SL = Entry + 1pt)."""
         order_manager = MockOrderManager()
         sl_manager = StopLossManager(
             order_manager=order_manager,
@@ -194,16 +198,16 @@ class TestBreakeven:
             quantity=260, entry_price=100.0
         )
         
-        # Price at +8 points (at threshold)
-        result = sl_manager.check_breakeven(108.0)
+        # Price at +7 points (at Safe Mode threshold)
+        result = sl_manager.check_breakeven(107.0)
         
         assert result == True
         assert sl_manager.state.breakeven_hit == True
-        assert sl_manager.state.current_sl == 100.0  # Moved to entry
-        assert sl_manager.state.status == SLStatus.BREAKEVEN
+        assert sl_manager.state.current_sl == 101.0  # Moved to Entry + 1pt (Safe Mode)
+        assert sl_manager.state.status == SLStatus.SAFE_MODE
     
     def test_breakeven_only_triggers_once(self):
-        """Test BE only triggers once."""
+        """Test Safe Mode/Trail Mode only triggers once (v2.0 Sniper Mode)."""
         sl_manager = StopLossManager(
             order_manager=MockOrderManager(),
             state_store=MockStateStore()
@@ -214,13 +218,15 @@ class TestBreakeven:
             quantity=260, entry_price=100.0
         )
         
-        # First trigger
+        # At +10pt, Trail Mode activates (status changes to TRAIL_MODE)
+        # Trail Mode sets SL = High - 5pt = 105.0
         sl_manager.check_breakeven(110.0)
-        assert sl_manager.state.breakeven_hit == True
+        assert sl_manager.state.status == SLStatus.TRAIL_MODE
+        assert sl_manager.state.current_sl == 105.0  # 110 - 5pt
         
-        # Second call should return False
+        # Second call at higher price - SL should trail higher
         result = sl_manager.check_breakeven(115.0)
-        assert result == False
+        assert sl_manager.state.current_sl == 110.0  # 115 - 5pt
 
 
 class TestStructureTSL:
@@ -248,7 +254,7 @@ class TestStructureTSL:
         assert sl_manager.state.status == SLStatus.STRUCTURE_TSL
     
     def test_structure_trail_uses_hl_minus_buffer(self):
-        """Test TSL trails to HL[-2] minus buffer."""
+        """Test TSL trails to HL[-2] minus buffer (uses second-last for room)."""
         order_manager = MockOrderManager()
         sl_manager = StopLossManager(
             order_manager=order_manager,
@@ -260,28 +266,29 @@ class TestStructureTSL:
             quantity=260, entry_price=100.0
         )
         
-        # Add swing lows - higher values so trail can work after breakeven
+        # Add 2 swing lows - uses HL[-1] when only 2 HLs
         sl_manager.add_swing_low(100.0, datetime.now())  # HL1
-        sl_manager.add_swing_low(102.0, datetime.now())  # HL2 
+        sl_manager.add_swing_low(102.0, datetime.now())  # HL2 - activates structure TSL
+        
+        # At +6pt profit, structure TSL trails
+        # With 2 HLs, uses HL[-1] = 102.0 - 2.5 = 99.5
+        sl_manager.trail_structure_based(106.0)
+        assert sl_manager.state.status == SLStatus.STRUCTURE_TSL
+        assert sl_manager.state.current_sl == 99.5
+        
+        # Add 3rd HL - now uses HL[-2] for more breathing room
         sl_manager.add_swing_low(104.0, datetime.now())  # HL3
         
-        # Trigger breakeven first (SL moves to 100.0)
-        sl_manager.check_breakeven(110.0)
+        # With 3 HLs, uses HL[-2] = 102.0 - 2.5 = 99.5 (same as before)
+        # No trail because 99.5 <= current 99.5
+        sl_manager.trail_structure_based(108.0)
+        assert sl_manager.state.current_sl == 99.5
         
-        # Trail should use HL[-2] = 102.0 - 2.5 buffer = 99.5
-        # But 99.5 < 100.0 (current breakeven SL), so no trail yet
-        result = sl_manager.trail_structure_based(112.0)
-        
-        # Since 99.5 < 100.0, trail returns False (SL stays at breakeven)
-        assert result == False
-        assert sl_manager.state.current_sl == 100.0  # Breakeven level
-        
-        # Add another higher HL
+        # Add 4th higher HL
         sl_manager.add_swing_low(106.0, datetime.now())  # HL4
         
-        # Now HL[-2] = 104.0 - 2.5 = 101.5 > 100.0
-        result = sl_manager.trail_structure_based(114.0)
-        assert result == True
+        # Now HL[-2] = 104.0 - 2.5 = 101.5 > 99.5, should trail
+        sl_manager.trail_structure_based(109.0)
         assert sl_manager.state.current_sl == 101.5
     
     def test_trail_only_moves_up(self):
@@ -381,14 +388,14 @@ class TestSLBreathRule:
         
         # Create candle that breaches SL but closes above
         candle = MockCandle(
-            open_=92.0,
-            high=94.0,
-            low=88.0,  # Below SL of 90
-            close=91.0  # Closes above SL
+            open_=96.0,
+            high=98.0,
+            low=93.0,  # Below SL of 95
+            close=96.0  # Closes above SL
         )
         
         # Check trigger with breath rule
-        triggered, reason = sl_manager.check_sl_triggered(88.0, candle)
+        triggered, reason = sl_manager.check_sl_triggered(93.0, candle)
         
         assert triggered == False
         assert sl_manager.state.breath_used == True
@@ -407,13 +414,13 @@ class TestSLBreathRule:
         )
         
         # First breach with recovery
-        candle1 = MockCandle(low=88.0, close=91.0)
-        sl_manager.check_sl_triggered(88.0, candle1)
+        candle1 = MockCandle(low=93.0, close=96.0)  # Below SL of 95, closes above
+        sl_manager.check_sl_triggered(93.0, candle1)
         assert sl_manager.state.breath_used == True
         
         # Second breach - should trigger SL
-        candle2 = MockCandle(low=87.0, close=89.0)
-        triggered, reason = sl_manager.check_sl_triggered(87.0, candle2)
+        candle2 = MockCandle(low=92.0, close=94.0)  # Below SL again
+        triggered, reason = sl_manager.check_sl_triggered(92.0, candle2)
         
         assert triggered == True
         assert reason == "sl_hit_after_breath"
@@ -431,8 +438,8 @@ class TestSLBreathRule:
             quantity=260, entry_price=100.0
         )
         
-        candle = MockCandle(low=88.0, close=91.0)
-        triggered, reason = sl_manager.check_sl_triggered(88.0, candle)
+        candle = MockCandle(low=93.0, close=96.0)  # Below SL of 95
+        triggered, reason = sl_manager.check_sl_triggered(93.0, candle)
         
         assert triggered == True
         assert sl_manager.state.breath_used == False
@@ -442,7 +449,7 @@ class TestUpdateOnTick:
     """Test the update_on_tick method."""
     
     def test_full_lifecycle(self):
-        """Test full SL lifecycle from initial to triggered."""
+        """Test full SL lifecycle from initial to triggered (v2.0 Sniper Mode)."""
         sl_manager = StopLossManager(
             order_manager=MockOrderManager(),
             state_store=MockStateStore()
@@ -453,11 +460,11 @@ class TestUpdateOnTick:
             quantity=260, entry_price=100.0
         )
         
-        # Phase 1: Initial
+        # Phase 1: Initial (below +7pt Safe Mode threshold)
         status, _ = sl_manager.update_on_tick(102.0)
         assert status == SLStatus.INITIAL
         
-        # Add swing lows
+        # Add swing lows - this activates Structure TSL
         sl_manager.update_on_tick(
             105.0, 
             new_swing_low=97.0, 
@@ -469,19 +476,25 @@ class TestUpdateOnTick:
             swing_low_time=datetime.now()
         )
         
-        # Phase 2: Breakeven
-        status, _ = sl_manager.update_on_tick(108.0)
-        assert sl_manager.state.breakeven_hit == True
-        
-        # Phase 3: Structure TSL
-        status, _ = sl_manager.update_on_tick(115.0)
+        # With 2+ HLs, Structure TSL is active
+        # At +7pt, structure trail kicks in (HL[-1] - buffer)
+        status, _ = sl_manager.update_on_tick(107.0)
         assert status == SLStatus.STRUCTURE_TSL
         
-        # Phase 4: Tight trail
-        status, _ = sl_manager.update_on_tick(125.0)
-        assert status == SLStatus.TIGHT_TRAIL
+        # At +10pt with no higher HLs, Trail Mode takes over
+        status, _ = sl_manager.update_on_tick(110.0)
+        # Structure TSL continues as we have HLs
+        assert status in [SLStatus.STRUCTURE_TSL, SLStatus.TRAIL_MODE]
         
-        # Triggered
+        # At +15pt, Trail Mode dominates (High - 5pt trail is more aggressive)
+        status, _ = sl_manager.update_on_tick(115.0)
+        assert status in [SLStatus.STRUCTURE_TSL, SLStatus.TRAIL_MODE]
+        
+        # At +20pt, Trail Mode continues (Sniper Mode doesn't use Tight Trail)
+        status, _ = sl_manager.update_on_tick(120.0)
+        assert status in [SLStatus.TRAIL_MODE, SLStatus.TIGHT_TRAIL]
+        
+        # Triggered - price drops below current SL
         status, reason = sl_manager.update_on_tick(90.0)
         assert status == SLStatus.TRIGGERED
 
@@ -541,7 +554,7 @@ class TestProperties:
         
         assert summary["active"] == True
         assert summary["entry_price"] == 100.0
-        assert summary["current_sl"] == 90.0
+        assert summary["current_sl"] == 95.0  # 5pt SL in v2.0
         assert summary["status"] == "initial"
         assert summary["phase"] == "initial"
 

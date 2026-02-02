@@ -29,6 +29,8 @@ from core.state_store import StateStore, get_state_store
 class SLStatus(Enum):
     """Stop Loss status."""
     INITIAL = "initial"           # At initial SL level
+    SAFE_MODE = "safe_mode"       # v2.0: SL moved to Entry + buffer
+    TRAIL_MODE = "trail_mode"     # v2.0: Trailing based on highest price
     BREAKEVEN = "breakeven"       # Moved to breakeven
     STRUCTURE_TSL = "structure"   # Structure-based trailing
     TIGHT_TRAIL = "tight"         # Tight trail (big profit)
@@ -38,7 +40,9 @@ class SLStatus(Enum):
 
 class TSLPhase(Enum):
     """Trailing Stop Loss phases."""
-    PHASE_1_INITIAL = "initial"       # Waiting for breakeven
+    PHASE_1_INITIAL = "initial"       # Waiting for safe mode
+    PHASE_1_SAFE = "safe_mode"        # v2.0: Safe mode active (+7pt, SL to Entry+1)
+    PHASE_2_TRAIL = "trail_mode"      # v2.0: Trail mode active (+10pt)
     PHASE_2_BREAKEVEN = "breakeven"   # At breakeven, waiting for structure
     PHASE_3_STRUCTURE = "structure"   # Structure-based trailing active
     PHASE_4_TIGHT = "tight"           # Tight trail after big profit
@@ -99,25 +103,28 @@ SLTriggerCallback = Callable[[float, str], None]  # (exit_price, reason)
 
 class StopLossManager:
     """
-    Bot-managed Stop Loss with N-Structure v1.1 Trailing.
+    Bot-managed Stop Loss with N-Structure v2.0 Sniper Mode Trailing.
     
-    Strategy:
-    1. Place initial SL at entry - 10 points
-    2. Monitor price, when profit >= 8 points:
-       - Move SL to entry (breakeven)
-    3. Track swing lows (HLs) during trade:
-       - When 2+ HLs formed, activate structure TSL
-       - Trail to HL[-2] (second-last HL) minus buffer
-    4. After +20 points profit:
-       - Switch to tight trail with smaller buffer
-    5. SL Breath Rule:
-       - Allow 1 candle to breach SL if structure intact
-       - Must recover within 3 points of SL
+    Strategy v2.0 Sniper Mode:
+    1. Place initial SL at entry - 5 points (tight SL)
+    2. Safe Mode: At +7pt profit, SL → Entry + 1pt (lock small profit)
+    3. Trail Mode: At +10pt profit, TSL = Highest - 5pt (trail the high)
+    4. Update TSL on every new high
+    
+    Legacy Structure TSL (optional):
+    - Track swing lows (HLs) during trade
+    - Trail to HL[-2] minus buffer
     """
     
-    # Configuration constants (v1.1)
-    DEFAULT_INITIAL_SL = 10.0         # 10 point SL
-    DEFAULT_BREAKEVEN_TRIGGER = 8.0   # BE at +8 points
+    # Configuration constants (v2.0 Sniper Mode)
+    DEFAULT_INITIAL_SL = 5.0          # v2.0: 5 point SL (tight)
+    DEFAULT_SAFE_MODE_TRIGGER = 7.0   # v2.0: Safe mode at +7pt
+    DEFAULT_SAFE_MODE_BUFFER = 1.0    # v2.0: SL = Entry + 1pt in safe mode
+    DEFAULT_TRAIL_MODE_TRIGGER = 10.0 # v2.0: Trail mode at +10pt
+    DEFAULT_TRAIL_MODE_BUFFER = 5.0   # v2.0: TSL = High - 5pt
+    
+    # Legacy constants
+    DEFAULT_BREAKEVEN_TRIGGER = 7.0   # Maps to safe mode
     DEFAULT_TSL_BUFFER = 2.5          # Buffer below swing low
     DEFAULT_TIGHT_TRIGGER = 20.0      # Tight trail at +20 points
     DEFAULT_TIGHT_BUFFER = 1.5        # Tighter buffer
@@ -133,27 +140,39 @@ class StopLossManager:
         tight_trigger_points: float = DEFAULT_TIGHT_TRIGGER,
         tight_buffer: float = DEFAULT_TIGHT_BUFFER,
         breath_range: float = DEFAULT_BREATH_RANGE,
-        enable_breath_rule: bool = True
+        enable_breath_rule: bool = True,
+        # v2.0 Sniper Mode parameters
+        safe_mode_trigger: float = DEFAULT_SAFE_MODE_TRIGGER,
+        safe_mode_buffer: float = DEFAULT_SAFE_MODE_BUFFER,
+        trail_mode_trigger: float = DEFAULT_TRAIL_MODE_TRIGGER,
+        trail_mode_buffer: float = DEFAULT_TRAIL_MODE_BUFFER,
+        enable_sniper_mode: bool = True  # v2.0: Enable sniper mode by default
     ):
         """
-        Initialize SL manager with v1.1 configuration.
+        Initialize SL manager with v2.0 Sniper Mode configuration.
         
         Args:
             order_manager: Order manager for placing/modifying orders
             state_store: State persistence store
-            initial_sl_points: Points below entry for initial SL (default: 10)
-            breakeven_trigger_points: Profit points to trigger breakeven (default: 8)
-            tsl_buffer: Buffer below swing low for TSL (default: 2.5)
-            tight_trigger_points: Profit to activate tight trail (default: 20)
-            tight_buffer: Buffer for tight trail (default: 1.5)
-            breath_range: Max breach for SL breath rule (default: 3)
-            enable_breath_rule: Enable SL breath rule (default: True)
+            initial_sl_points: Points below entry for initial SL (default: 5)
+            safe_mode_trigger: Profit points to trigger safe mode (default: 7)
+            safe_mode_buffer: Buffer above entry in safe mode (default: 1)
+            trail_mode_trigger: Profit to activate trail mode (default: 10)
+            trail_mode_buffer: Buffer below high in trail mode (default: 5)
+            enable_sniper_mode: Use v2.0 sniper mode TSL (default: True)
         """
         self._order_manager = order_manager or get_order_manager()
         self._store = state_store or get_state_store()
         
-        # Configuration
+        # v2.0 Sniper Mode Configuration
         self.initial_sl_points = initial_sl_points
+        self.safe_mode_trigger = safe_mode_trigger
+        self.safe_mode_buffer = safe_mode_buffer
+        self.trail_mode_trigger = trail_mode_trigger
+        self.trail_mode_buffer = trail_mode_buffer
+        self.enable_sniper_mode = enable_sniper_mode
+        
+        # Legacy configuration
         self.breakeven_trigger_points = breakeven_trigger_points
         self.tsl_buffer = tsl_buffer
         self.tight_trigger_points = tight_trigger_points
@@ -302,19 +321,94 @@ class StopLossManager:
     
     def check_breakeven(self, current_price: float) -> bool:
         """
-        Check and move SL to breakeven if conditions met.
+        Check and apply v2.0 Sniper Mode trailing (Safe Mode → Trail Mode).
+        
+        v2.0 Sniper Mode Logic:
+        1. Safe Mode: At +7pt profit → SL = Entry + 1pt
+        2. Trail Mode: At +10pt profit → TSL = Highest - 5pt
+        
+        Falls back to legacy breakeven if sniper mode disabled.
         
         Args:
             current_price: Current market price
             
         Returns:
-            True if breakeven was hit
+            True if SL was modified
         """
-        if not self._state or self._state.breakeven_hit:
+        if not self._state:
             return False
         
         self.update_highest_price(current_price)
         profit = current_price - self._state.entry_price
+        
+        # v2.0 Sniper Mode
+        if self.enable_sniper_mode:
+            return self._check_sniper_mode_trail(current_price, profit)
+        
+        # Legacy breakeven logic
+        return self._check_legacy_breakeven(current_price, profit)
+    
+    def _check_sniper_mode_trail(self, current_price: float, profit: float) -> bool:
+        """
+        v2.0 Sniper Mode trailing logic.
+        
+        Phase 1 (Safe Mode): At +7pt → SL = Entry + 1pt
+        Phase 2 (Trail Mode): At +10pt → TSL = Highest - 5pt
+        
+        Returns:
+            True if SL was modified
+        """
+        modified = False
+        
+        # Check Trail Mode first (higher priority)
+        if profit >= self.trail_mode_trigger:
+            # Trail Mode: TSL = Highest - buffer
+            new_sl = self._state.highest_price - self.trail_mode_buffer
+            
+            # Only trail up, never down
+            if new_sl > self._state.current_sl:
+                success = self._modify_sl(new_sl)
+                if success:
+                    if self._state.tsl_phase != TSLPhase.PHASE_2_TRAIL:
+                        logger.success(
+                            f"🎯 TRAIL MODE activated! +{profit:.1f}pt profit | "
+                            f"TSL = High({self._state.highest_price:.2f}) - {self.trail_mode_buffer}pt = {new_sl:.2f}"
+                        )
+                    else:
+                        logger.info(
+                            f"📈 TSL trailed: {new_sl:.2f} | High={self._state.highest_price:.2f} | "
+                            f"Profit: +{profit:.1f}pt"
+                        )
+                    
+                    self._state.tsl_phase = TSLPhase.PHASE_2_TRAIL
+                    self._state.status = SLStatus.TRAIL_MODE
+                    self._persist_state()
+                    modified = True
+        
+        # Check Safe Mode (if not yet in trail mode)
+        elif profit >= self.safe_mode_trigger and self._state.tsl_phase == TSLPhase.PHASE_1_INITIAL:
+            # Safe Mode: SL = Entry + buffer (lock small profit)
+            new_sl = self._state.entry_price + self.safe_mode_buffer
+            
+            if new_sl > self._state.current_sl:
+                success = self._modify_sl(new_sl)
+                if success:
+                    logger.success(
+                        f"🛡️ SAFE MODE activated! +{profit:.1f}pt profit | "
+                        f"SL = Entry({self._state.entry_price:.2f}) + {self.safe_mode_buffer}pt = {new_sl:.2f}"
+                    )
+                    self._state.tsl_phase = TSLPhase.PHASE_1_SAFE
+                    self._state.status = SLStatus.SAFE_MODE
+                    self._state.breakeven_hit = True  # Treat as breakeven for compatibility
+                    self._persist_state()
+                    modified = True
+        
+        return modified
+    
+    def _check_legacy_breakeven(self, current_price: float, profit: float) -> bool:
+        """Legacy breakeven logic (fallback if sniper mode disabled)."""
+        if self._state.breakeven_hit:
+            return False
         
         if profit >= self.breakeven_trigger_points:
             # Move SL to breakeven
@@ -660,23 +754,33 @@ def get_sl_manager(
 
 
 def initialize_sl_manager(
-    initial_sl_points: float = 10.0,
-    breakeven_trigger_points: float = 8.0,
+    initial_sl_points: float = 5.0,       # v2.0: 5pt SL
+    breakeven_trigger_points: float = 7.0,
     tsl_buffer: float = 2.5,
     tight_trigger_points: float = 20.0,
     tight_buffer: float = 1.5,
-    enable_breath_rule: bool = True
+    enable_breath_rule: bool = True,
+    # v2.0 Sniper Mode parameters
+    safe_mode_trigger: float = 7.0,       # Safe mode at +7pt
+    safe_mode_buffer: float = 1.0,        # SL = Entry + 1pt
+    trail_mode_trigger: float = 10.0,     # Trail mode at +10pt
+    trail_mode_buffer: float = 5.0,       # TSL = High - 5pt
+    enable_sniper_mode: bool = True       # Enable sniper mode
 ) -> StopLossManager:
     """
-    Initialize SL manager with custom configuration.
+    Initialize SL manager with v2.0 Sniper Mode configuration.
+    
+    v2.0 Sniper Mode:
+    - Safe Mode: At +7pt → SL = Entry + 1pt
+    - Trail Mode: At +10pt → TSL = High - 5pt
     
     Args:
-        initial_sl_points: Points below entry for initial SL
-        breakeven_trigger_points: Profit to trigger breakeven
-        tsl_buffer: Buffer below swing low for TSL
-        tight_trigger_points: Profit to activate tight trail
-        tight_buffer: Buffer for tight trail
-        enable_breath_rule: Enable SL breath rule
+        initial_sl_points: Points below entry for initial SL (default: 5)
+        safe_mode_trigger: Profit to trigger safe mode (default: 7)
+        safe_mode_buffer: Buffer above entry in safe mode (default: 1)
+        trail_mode_trigger: Profit to activate trail mode (default: 10)
+        trail_mode_buffer: Buffer below high in trail mode (default: 5)
+        enable_sniper_mode: Use v2.0 sniper mode (default: True)
         
     Returns:
         Initialized StopLossManager
@@ -688,6 +792,11 @@ def initialize_sl_manager(
         tsl_buffer=tsl_buffer,
         tight_trigger_points=tight_trigger_points,
         tight_buffer=tight_buffer,
-        enable_breath_rule=enable_breath_rule
+        enable_breath_rule=enable_breath_rule,
+        safe_mode_trigger=safe_mode_trigger,
+        safe_mode_buffer=safe_mode_buffer,
+        trail_mode_trigger=trail_mode_trigger,
+        trail_mode_buffer=trail_mode_buffer,
+        enable_sniper_mode=enable_sniper_mode
     )
     return _sl_manager

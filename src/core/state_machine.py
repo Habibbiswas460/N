@@ -141,11 +141,13 @@ class TradingStateMachine:
     VALID_TRANSITIONS = {
         TradingState.IDLE: [
             TradingState.WATCHING_BREAKOUT,
+            TradingState.ARMED,  # v2.0: Direct entry from DualDirectionDetector
             TradingState.PAUSED,
             TradingState.ERROR
         ],
         TradingState.WATCHING_BREAKOUT: [
             TradingState.TRACKING_PULLBACK,
+            TradingState.ARMED,  # v2.0: Direct entry when pattern ready
             TradingState.IDLE,
             TradingState.PAUSED,
             TradingState.ERROR
@@ -153,6 +155,7 @@ class TradingStateMachine:
         TradingState.TRACKING_PULLBACK: [
             TradingState.VALIDATING_HL,
             TradingState.WATCHING_BREAKOUT,
+            TradingState.ARMED,  # v2.0: Direct entry when pattern ready
             TradingState.IDLE,
             TradingState.PAUSED,
             TradingState.ERROR
@@ -160,6 +163,7 @@ class TradingStateMachine:
         TradingState.VALIDATING_HL: [
             TradingState.CHECKING_DIVERGENCE,
             TradingState.TRACKING_PULLBACK,
+            TradingState.ARMED,  # v2.0: Direct entry when pattern ready
             TradingState.IDLE,
             TradingState.PAUSED,
             TradingState.ERROR
@@ -706,9 +710,23 @@ class TradingStateMachine:
         self._context.index_price = index_candle.close
         self._context.option_price = option_candle.close
         
-        # Handle states based on N-Structure detection
+        # v2.0: PRIORITY - Universal READY_FOR_ENTRY handling (DualDirectionDetector)
+        # Check this FIRST before any legacy state-based processing
+        if (self._state not in [TradingState.ARMED, TradingState.IN_POSITION, TradingState.PENDING_REENTRY] and
+            n_structure and n_structure.divergence_confirmed and n_structure.entry_trigger):
+            self._context.entry_trigger_price = n_structure.entry_trigger
+            self._context.divergence_confirmed = True
+            self._context.n_structure = n_structure
+            self.transition_to(
+                TradingState.ARMED,
+                f"N-Structure READY! Entry trigger: {n_structure.entry_trigger:.2f}"
+            )
+            self._persist_state()
+            return  # Exit early - armed for entry
+        
+        # Handle states based on N-Structure detection (legacy path)
         if self._state == TradingState.IDLE:
-            # Look for breakout setup
+            # Legacy: step-by-step detection
             if n_structure and n_structure.status.value == "watching_breakout":
                 self.transition_to(
                     TradingState.WATCHING_BREAKOUT,

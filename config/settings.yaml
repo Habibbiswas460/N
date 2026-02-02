@@ -1,10 +1,12 @@
 # N-Structure Momentum Breakout Strategy Configuration
 # =====================================================
-# OPTIMIZED from 3-month backtest: +₹42,659 profit
+# 🔥 ULTIMATE SNIPER v5.2 - CONFIRMATION CANDLE EDITION 🔥
+# New: 2-candle confirmation, volume filter, gap filter
+# Optimized for avoiding early entries and catching real moves
 
 strategy:
-  name: "N-Structure Momentum Breakout"
-  version: "1.2.0"  # v1.2 with re-entry
+  name: "N-Structure Ultimate Sniper"
+  version: "5.2.0"  # v5.2 with Confirmation Candle
   timeframe: "1m"  # 1-minute candles only
 
 # Index Configuration
@@ -21,16 +23,36 @@ option:
   exchange_type: 2  # NSE_FO
   expiry_preference: "weekly"  # weekly or monthly
   
-  # ATM Strike Selection
-  strike_selection:
-    method: "atm_premium_filter"
-    premium_min: 90   # Minimum premium in ₹
-    premium_max: 110  # Maximum premium in ₹
-    strike_range: 3   # Check ±3 strikes from ATM
+  # Trade Direction: "CE_ONLY", "PE_ONLY", or "BOTH"
+  trade_direction: "BOTH"  # 🔥 Now trades both CE and PE!
+  
+  # ATM Strike Selection (Legacy - now DEPRECATED, use strike_selection below)
+  # NOTE: This is only for initial ATM reference, actual selection uses dynamic_strike_selector
+  legacy_strike_selection:
+    method: "atm_dynamic"  # DEPRECATED - uses strike_selection.premium_min/max now
+    premium_min: 85       # Aligned with strike_selection
+    premium_max: 110      # Aligned with strike_selection
+    strike_range: 5       # Aligned with strike_selection
+    enable_dynamic_reselection: true  # 🔥 Re-select when ATM changes (CRITICAL!)
     
-  # Re-evaluation triggers
+  # Re-evaluation triggers (for reference, now auto at every 50-point ATM shift)
   reeval_interval_minutes: 15
   reeval_index_move: 50  # Re-evaluate if index moves ₹50
+
+# 🔥 DYNAMIC STRIKE SELECTION v3.0 - Select AFTER N-Structure!
+# Logic: INDEX এ HH+HL দেখলে তখন strike select করবে (85-110 range)
+strike_selection:
+  # Premium range for dynamic selection
+  premium_min: 85.0           # Minimum premium ₹85
+  premium_max: 110.0          # Maximum premium ₹110
+  premium_sweet_min: 90.0     # Sweet spot starts ₹90
+  premium_sweet_max: 100.0    # Sweet spot ends ₹100
+  strike_range: 5             # Check ±5 strikes from ATM
+  
+  # Selection scoring weights
+  scoring:
+    atm_distance_weight: 30   # Closer to ATM = higher score
+    sweet_spot_bonus: 20      # Bonus for ₹90-100 premium
 
 # Technical Indicators
 indicators:
@@ -38,11 +60,24 @@ indicators:
     fast_period: 9
     slow_period: 15
     
-  # N-Structure Parameters (OPTIMIZED)
+  # N-Structure Parameters (🔥 v5.2 - Confirmation Candle)
   n_structure:
-    min_hl_gap_candles: 5     # Minimum candles between HL1 and HL2
-    min_hl_gap_points: 3.0    # INCREASED from 2.0 for better momentum validation
-    entry_buffer: 1.5         # Entry trigger: High + 1.5 points
+    buffer: 1.5                 # Entry buffer above/below breakout
+    min_swing_gap_candles: 5    # Min 5 candles between swings
+    min_swing_gap_points: 2.0   # Min 2pt between swing points
+    
+    # 🔥 v5.1: Volume Confirmation (avoid false breakouts)
+    volume_confirmation_enabled: true
+    min_volume_ratio: 1.5       # Breakout volume must be 1.5x average
+    volume_lookback: 20         # Candles for volume average
+    
+    # 🔥 v5.1: Gap Filter (skip signals on large gap days)
+    gap_filter_enabled: true
+    max_gap_points: 50.0        # Skip first signal if gap > 50 points
+    
+    # 🔥 v5.2: Confirmation Candle (avoid early entries)
+    confirmation_candles: 2     # Wait 2 candles after pattern detected
+    require_direction_candle: true  # Confirmation candle must be green (CE) or red (PE)
     
   # Divergence Detection
   divergence:
@@ -50,35 +85,48 @@ indicators:
     index_sideways_threshold: 0.0005  # 0.05% - Index considered sideways
     option_strength_threshold: 0.0005  # 0.05% - Option shows strength
 
-# Entry Logic (OPTIMIZED from backtest)
+# Entry Logic (🔥 ULTIMATE SNIPER v5.0 - PULLBACK ENTRY)
 entry:
-  buffer_points: 1.5          # Entry trigger: High + 1.5 points
-  limit_buffer_points: 2.0    # Limit price: High + 2.0 points
+  buffer_points: 2.5          # v3.0: Entry trigger: High + 2.5 points
+  limit_buffer_points: 3.0    # Limit price: High + 3.0 points
+  slippage_buffer_points: 0.75  # 🔥 CRITICAL FIX: Add buffer for real market slippage
   order_type: "STOPLOSS_LIMIT"
   variety: "STOPLOSS"
   product_type: "INTRADAY"    # MIS for intraday
   
-  # Entry Filters (from backtest)
-  min_candle_body_pct: 50     # Min 50% body (strong candle)
-  min_candle_range: 3.0       # Min 3 points range
-  close_near_high_pct: 30     # Close must be in top 30%
+  # 🔥 PULLBACK ENTRY - Game Changer! (Reduces SL by 59%)
+  enable_pullback_entry: true   # Wait for pullback to entry level
+  pullback_timeout_candles: 10  # Max 10 candles to wait for pullback
+  
+  # Entry Filters (RELAXED - focus on any valid setup)
+  min_candle_body_pct: 50     # 50% body = normal candle (relaxed from 65%)
+  min_candle_range: 1.5       # Min 1.5 points range (relaxed from 2.0)
+  close_near_high_pct: 50     # Close in top 50%
 
-# Exit Logic - UNLIMITED TRAILING (OPTIMIZED)
+# Exit Logic - v2.0 SNIPER MODE (from backtest)
 exit:
   # Initial Stop Loss
-  initial_sl_points: 10.0     # FIXED 10 point SL
+  initial_sl_points: 5.0      # v3.0: TIGHT 5 point SL (was 10)
   
   # NO FIXED TARGET - Let winners run!
   use_fixed_target: false
   target_points: 0            # Disabled - use TSL
   
-  # Trailing Stop Loss - STRUCTURE BASED (v1.1)
+  # Trailing Stop Loss - SNIPER MODE (v2.0)
   trailing:
     enabled: true
-    method: "structure_hl"    # HL-based trailing (not candle low)
+    method: "sniper_mode"     # v2.0: Safe Mode → Trail Mode
     
-    # Phase 1: Breakeven
-    breakeven_trigger_points: 8.0   # Move SL to BE when +8 points
+    # Phase 1: Safe Mode (Lock profit at +7pt)
+    safe_mode_trigger: 7.0    # v2.0: At +7pt profit, SL → Entry + 1pt
+    safe_mode_sl_buffer: 1.0  # SL = Entry + 1pt (lock small profit)
+    
+    # Phase 2: Trail Mode (at +10pt)
+    trail_mode_trigger: 10.0  # v2.0: At +10pt, start trailing
+    trail_mode_buffer: 5.0    # TSL = High - 5pt
+    
+    # Legacy (disabled)
+    breakeven_trigger_points: 7.0   # Now handled by safe_mode
     
     # Phase 2: Structure TSL (N-Structure v1.1)
     structure_tsl:
@@ -99,30 +147,83 @@ exit:
     structure_required: true        # Only if structure intact
     within_range_points: 3.0        # Within 3pt of SL
 
-# Risk Management (OPTIMIZED)
+# Risk Management (🔥 ULTIMATE SNIPER v5.2 - PRODUCTION READY)
 risk:
-  # Position Sizing - FIXED 4 LOTS
-  lot_size: 65                # NIFTY lot = 65 qty (updated)
-  num_lots: 4                 # Always 4 lots = 260 qty
-  fixed_quantity: 260         # 65 × 4
+  # ═══════════════════════════════════════════════════════════════
+  # 💰 POSITION SIZING OPTIONS - Choose Your Risk Level!
+  # ═══════════════════════════════════════════════════════════════
   
-  # Per Trade Risk
-  sl_points: 10.0             # 10 point SL
-  risk_per_trade: 2600        # ₹2,600 per trade (10 × 260)
+  # Base Settings
+  lot_size: 65                # NIFTY lot = 65 qty
+  sl_points: 5.0              # 5 point SL (FIXED)
+  margin_per_lot: 15000.0     # ≈₹15,000 margin per NIFTY lot
   
-  # Circuit Breakers - MAX SL ONLY!
-  max_sl_per_day: 3           # ONLY limiter: 3 SL hits max
-  max_daily_loss: 7800        # 3 × ₹2,600 = ₹7,800 max
+  # ┌─────────────────────────────────────────────────────────────┐
+  # │ 🟢 CONSERVATIVE (Default) - 4 Lots                         │
+  # │ Risk: ₹1,300/trade | Capital: ₹30K | Drawdown: 4.3%        │
+  # ├─────────────────────────────────────────────────────────────┤
+  # │ 🟡 MODERATE - 6 Lots                                        │
+  # │ Risk: ₹1,950/trade | Capital: ₹50K | Drawdown: 3.9%        │
+  # ├─────────────────────────────────────────────────────────────┤
+  # │ 🔴 AGGRESSIVE - 8 Lots                                      │
+  # │ Risk: ₹2,600/trade | Capital: ₹75K | Drawdown: 3.5%        │
+  # ├─────────────────────────────────────────────────────────────┤
+  # │ 🔥 ULTRA AGGRESSIVE - 12 Lots                               │
+  # │ Risk: ₹3,900/trade | Capital: ₹1L+ | Drawdown: 3.9%        │
+  # └─────────────────────────────────────────────────────────────┘
   
-  # NO trade limit - unlimited trades until 3 SL
-  max_trades_per_day: 999     # Effectively unlimited
+  # === ACTIVE POSITION SIZE (Change this!) ===
+  position_mode: "moderate"   # conservative | moderate | aggressive | ultra
+  
+  # Position Size Profiles
+  position_profiles:
+    conservative:
+      num_lots: 4
+      fixed_quantity: 260     # 65 × 4
+      risk_per_trade: 1300    # ₹1,300
+      recommended_capital: 30000
+      max_daily_loss: 1300    # 1 SL
+      
+    moderate:
+      num_lots: 6
+      fixed_quantity: 390     # 65 × 6
+      risk_per_trade: 1950    # ₹1,950
+      recommended_capital: 50000
+      max_daily_loss: 1950    # 1 SL
+      
+    aggressive:
+      num_lots: 8
+      fixed_quantity: 520     # 65 × 8
+      risk_per_trade: 2600    # ₹2,600
+      recommended_capital: 75000
+      max_daily_loss: 2600    # 1 SL
+      
+    ultra:
+      num_lots: 12
+      fixed_quantity: 780     # 65 × 12
+      risk_per_trade: 3900    # ₹3,900
+      recommended_capital: 100000
+      max_daily_loss: 3900    # 1 SL
+  
+  # Legacy (for backward compatibility)
+  num_lots: 6                 # Default: Moderate (6 lots)
+  fixed_quantity: 390         # 65 × 6
+  risk_per_trade: 1950        # ₹1,950 per trade
+  
+  # ═══════════════════════════════════════════════════════════════
+  # 🔥 SNIPER MODE - Only 1 SL per day!
+  # ═══════════════════════════════════════════════════════════════
+  max_sl_per_day: 1           # SNIPER MODE ON - 1 SL = Day Over
+  max_daily_loss: 1950        # Max loss/day (based on position_mode)
+  max_daily_loss_pct: 5.0     # Max 5% of capital loss/day
+  max_trades_per_day: 10      # Safety cap on trades
   
   # Cooldown
   cooldown_candles: 15        # Wait 15 candles after trade
   cooldown_after_sl: 30       # Double cooldown after SL hit
   
   # Capital (for paper trading)
-  paper_capital: 100000       # ₹1,00,000
+  paper_capital: 50000        # ₹50,000 (moderate mode)
 
 # RE-ENTRY LOGIC (NEW - Option A)
 reentry:
@@ -135,14 +236,15 @@ reentry:
   min_candle_body_pct: 40     # 40% body (relaxed from 50%)
   min_candle_range: 2.0       # 2 points (relaxed from 3)
 
-# Timing
+# Timing (PRODUCTION SETTINGS)
 timing:
   market_open: "09:15"
   market_close: "15:30"
-  trading_start: "09:50"      # Don't trade first 35 mins
-  no_new_trades_after: "12:30" # Entries only till 12:30
-  manage_till: "14:40"        # Manage active trades till 2:40
+  trading_start: "09:50"        # Don't trade first 35 mins
+  no_new_trades_after: "12:30"  # Entries only till 12:30
+  manage_till: "14:40"          # Manage active trades till 2:40
   instrument_download_time: "08:30"
+  enable_time_filter: true      # Enable time-based trading restrictions
   
   # Session Management
   auto_logout: true

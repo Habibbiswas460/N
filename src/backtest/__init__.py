@@ -1,11 +1,11 @@
 """Backtest module."""
 from .historical_data import HistoricalDataFetcher, HistoricalCandle
-from .backtester import NStructureBacktester, BacktestResult, print_results
+from .backtester import NStructureBacktesterV2, BacktestResult, print_results_v2
 
 __all__ = [
     "HistoricalDataFetcher",
     "HistoricalCandle",
-    "NStructureBacktester",
+    "NStructureBacktesterV2",
     "BacktestResult",
-    "print_results"
+    "print_results_v2"
 ]

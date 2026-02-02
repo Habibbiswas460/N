@@ -120,7 +120,8 @@ class TelegramNotifier:
         entry_price: float,
         sl_price: float,
         quantity: int,
-        is_reentry: bool = False
+        is_reentry: bool = False,
+        direction: str = "CE"  # "CE" or "PE"
     ) -> bool:
         """
         Send trade entry notification.
@@ -131,12 +132,21 @@ class TelegramNotifier:
             sl_price: Stop loss price
             quantity: Position quantity
             is_reentry: Whether this is a re-entry
+            direction: Trade direction (CE/PE)
         """
-        trade_type = "🔄 RE-ENTRY" if is_reentry else "🟢 ENTRY"
+        if is_reentry:
+            trade_type = "🔄 RE-ENTRY"
+        elif direction == "PE":
+            trade_type = "🔴 PE ENTRY"
+        else:
+            trade_type = "🟢 CE ENTRY"
+        
+        dir_emoji = "📈" if direction == "CE" else "📉"
         
         text = f"""
-{trade_type} EXECUTED
+{trade_type} EXECUTED {dir_emoji}
 
+<b>Direction:</b> {direction} ({"BULLISH" if direction == "CE" else "BEARISH"})
 <b>Symbol:</b> {symbol}
 <b>Entry:</b> ₹{entry_price:.2f}
 <b>SL:</b> ₹{sl_price:.2f}

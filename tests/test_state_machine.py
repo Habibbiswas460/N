@@ -263,14 +263,15 @@ class TestProperties:
 class TestInvalidTransitions:
     """Test invalid state transitions."""
     
-    def test_cannot_arm_from_idle(self):
-        """Test cannot directly go to ARMED from IDLE."""
+    def test_can_arm_from_idle_v2(self):
+        """Test v2.0: CAN directly go to ARMED from IDLE (changed behavior)."""
         fsm = TradingStateMachine(state_store=MockStateStore())
         
+        # v2.0: IDLE→ARMED is now ALLOWED for quick setup
         result = fsm.transition_to(TradingState.ARMED)
         
-        assert result == False
-        assert fsm.state == TradingState.IDLE
+        assert result == True  # v2.0: This is now allowed
+        assert fsm.state == TradingState.ARMED
     
     def test_cannot_enter_from_cooldown(self):
         """Test cannot enter position from COOLDOWN."""

@@ -1,9 +1,11 @@
 """
-Unit Tests for Risk Manager v1.2
+Unit Tests for Risk Manager v2.0 - PRODUCTION READY
 
-Tests the simplified risk management with max SL only:
-- Fixed 260 qty position sizing
-- Max 3 SL hits per day (only limiter)
+Tests the production-ready risk management:
+- Position sizing with capital validation
+- Max SL per day (Sniper Mode: 1)
+- Daily loss limits (absolute + percentage)
+- Time-based trading windows
 - Cooldown after trades
 - Re-entry tracking
 """
@@ -18,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from risk.risk_manager import (
     RiskManager, RiskLimits, RiskStatus, RiskEvent, TradeRecord,
-    initialize_risk_manager
+    initialize_risk_manager, reset_risk_manager
 )
 
 
@@ -55,10 +57,16 @@ class MockStateStore:
 
 
 def create_test_risk_manager(**kwargs):
-    """Create a RiskManager with time filter disabled for testing."""
-    limits_kwargs = {'enable_time_filter': False}
-    limits_kwargs.update(kwargs)
-    limits = RiskLimits(**limits_kwargs)
+    """Create a RiskManager with time filter disabled and sufficient capital for testing."""
+    # Set defaults for testing (disable time filter, provide sufficient capital)
+    defaults = {
+        'enable_time_filter': False,  # Disable time restrictions for tests
+        'capital': 100000.0,          # ₹1L capital for tests
+        'margin_per_lot': 15000.0,    # ₹15K per lot
+        'num_lots': 6,                # 6 lots
+    }
+    defaults.update(kwargs)
+    limits = RiskLimits(**defaults)
     store = MockStateStore()
     rm = RiskManager(limits=limits, state_store=store)
     store.set_risk_manager(rm)  # Link back for syncing
@@ -69,15 +77,15 @@ class TestRiskLimits:
     """Test risk limits configuration."""
     
     def test_default_limits(self):
-        """Test default risk limits."""
+        """Test default risk limits (v2.0 production defaults)."""
         limits = RiskLimits()
         
         assert limits.lot_size == 65
-        assert limits.num_lots == 4
-        assert limits.fixed_quantity == 260
-        assert limits.sl_points == 10.0
-        assert limits.risk_per_trade == 2600.0
-        assert limits.max_sl_per_day == 3
+        assert limits.num_lots == 6            # v2.0: Moderate mode (6 lots)
+        assert limits.fixed_quantity == 390    # 65 × 6
+        assert limits.sl_points == 5.0         # v2.0: Tight 5pt SL
+        assert limits.risk_per_trade == 1950.0 # 5 × 390
+        assert limits.max_sl_per_day == 1      # SNIPER MODE: 1 SL/day
         assert limits.max_reentries_per_day == 2
     
     def test_custom_limits(self):
@@ -102,17 +110,20 @@ class TestRiskManagerInitialization:
         """Test default initialization."""
         rm = create_test_risk_manager()
         
-        assert rm.limits.fixed_quantity == 260
-        assert rm.limits.max_sl_per_day == 3
+        # Uses our test defaults (6 lots, 390 qty)
+        assert rm.limits.fixed_quantity == 390
+        assert rm.limits.max_sl_per_day == 1  # v2.0 Sniper Mode
         assert rm.can_trade == True
     
     def test_initialize_function(self):
         """Test initialize_risk_manager function."""
+        reset_risk_manager()  # Reset singleton first
         rm = initialize_risk_manager(
             lot_size=50,
             num_lots=3,
             sl_points=15.0,
-            max_sl_per_day=4
+            max_sl_per_day=4,
+            capital=100000.0  # Sufficient capital
         )
         # Disable time filter for testing
         rm.limits.enable_time_filter = False
@@ -138,28 +149,26 @@ class TestCanTrade:
         assert reason == "OK"
     
     def test_blocked_after_max_sl(self):
-        """Test trading blocked after max SL hits."""
-        rm = create_test_risk_manager()
+        """Test trading blocked after max SL hits (Sniper Mode: 1 SL)."""
+        rm = create_test_risk_manager(max_sl_per_day=1)  # Sniper Mode
         
-        # Hit 3 SL
-        rm.record_trade(-2600, -10.0, "sl_hit")
-        rm.record_trade(-2600, -10.0, "sl_hit")
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        # Hit 1 SL - should block trading
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         can_trade, reason = rm.can_enter_trade()
         
         assert can_trade == False
-        assert "Max SL hits reached" in reason
+        assert "SNIPER MODE" in reason or "SL limit" in reason
     
     def test_unlimited_profitable_trades(self):
-        """Test unlimited trades when profitable."""
-        rm = create_test_risk_manager()
+        """Test trades allowed when profitable (until max_trades_per_day)."""
+        rm = create_test_risk_manager(max_sl_per_day=3, max_trades_per_day=15)
         
         # 10 profitable trades
         for i in range(10):
             rm.record_trade(5000, 20.0, "tsl_exit")
-            rm.tick_cooldown()  # Clear cooldown
-            for _ in range(20):  # Wait cooldown
+            # Clear cooldown
+            for _ in range(20):
                 rm.tick_cooldown()
         
         can_trade, reason = rm.can_enter_trade()
@@ -194,21 +203,21 @@ class TestRecordTrade:
         rm = create_test_risk_manager()
         
         status = rm.record_trade(
-            pnl=-2600.0,
-            pnl_points=-10.0,
+            pnl=-1950.0,  # v2.0: 5pt SL × 390 qty
+            pnl_points=-5.0,
             exit_reason="sl_hit"
         )
         
         assert status.losses_today == 1
         assert status.sl_hits_today == 1
-        assert status.daily_pnl == -2600.0
+        assert status.daily_pnl == -1950.0
     
     def test_record_reentry(self):
         """Test recording a re-entry trade."""
-        rm = create_test_risk_manager()
+        rm = create_test_risk_manager(max_sl_per_day=3)  # Allow more SLs for this test
         
         # First trade SL hit
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         # Re-entry trade
         status = rm.record_trade(
@@ -238,7 +247,7 @@ class TestCooldown:
         """Test longer cooldown after SL hit."""
         rm = create_test_risk_manager()
         
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         assert rm.in_cooldown == True
         assert rm.status.cooldown_candles_remaining == 30  # SL cooldown
@@ -272,10 +281,13 @@ class TestReentry:
     """Test re-entry logic."""
     
     def test_can_reenter_after_sl(self):
-        """Test can re-enter after SL hit."""
-        rm = create_test_risk_manager()
+        """Test can re-enter after SL hit (with sufficient daily loss headroom)."""
+        rm = create_test_risk_manager(
+            max_sl_per_day=3,  # Allow more SLs for test
+            max_daily_loss=10000.0  # High limit so 1 SL doesn't block
+        )
         
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         # Clear cooldown
         for _ in range(30):
@@ -296,13 +308,20 @@ class TestReentry:
     
     def test_max_reentries_limit(self):
         """Test max re-entries limit."""
-        rm = create_test_risk_manager()
+        rm = create_test_risk_manager(max_sl_per_day=5)  # Allow more SLs
         
         # First SL hit and 2 re-entries
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        rm.record_trade(-1950, -5.0, "sl_hit")
+        for _ in range(30): rm.tick_cooldown()
+        
         rm.record_trade(3000, 12.0, "tsl_exit", is_reentry=True)
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        for _ in range(15): rm.tick_cooldown()
+        
+        rm.record_trade(-1950, -5.0, "sl_hit")
+        for _ in range(30): rm.tick_cooldown()
+        
         rm.record_trade(3000, 12.0, "tsl_exit", is_reentry=True)
+        for _ in range(15): rm.tick_cooldown()
         
         # Third re-entry should be blocked
         can_reenter, reason = rm.can_reenter()
@@ -315,18 +334,18 @@ class TestPositionSize:
     """Test position sizing."""
     
     def test_fixed_position_size(self):
-        """Test fixed position size returned."""
+        """Test fixed position size returned (v2.0: 390 qty)."""
         rm = create_test_risk_manager()
         
         qty = rm.get_position_size()
         
-        assert qty == 260
+        assert qty == 390  # 6 lots × 65
     
     def test_validate_correct_size(self):
         """Test validation accepts correct size."""
         rm = create_test_risk_manager()
         
-        is_valid, reason = rm.validate_position_size(260)
+        is_valid, reason = rm.validate_position_size(390)
         
         assert is_valid == True
     
@@ -344,25 +363,22 @@ class TestRiskBudget:
     """Test risk budget calculations."""
     
     def test_remaining_sl_budget(self):
-        """Test remaining SL budget calculation."""
-        rm = create_test_risk_manager()
+        """Test remaining SL budget calculation (Sniper Mode: 1 SL)."""
+        rm = create_test_risk_manager(max_sl_per_day=1)
         
-        assert rm.get_remaining_sl_budget() == 3
-        
-        rm.record_trade(-2600, -10.0, "sl_hit")
-        assert rm.get_remaining_sl_budget() == 2
-        
-        rm.record_trade(-2600, -10.0, "sl_hit")
         assert rm.get_remaining_sl_budget() == 1
+        
+        rm.record_trade(-1950, -5.0, "sl_hit")
+        assert rm.get_remaining_sl_budget() == 0
     
     def test_max_loss_today(self):
-        """Test max loss calculation."""
-        rm = create_test_risk_manager()
+        """Test max loss calculation (v2.0: 1 SL × ₹1,950)."""
+        rm = create_test_risk_manager(max_sl_per_day=1)
         
         max_loss = rm.get_max_loss_today()
         
-        # 3 SL × ₹2,600 = ₹7,800
-        assert max_loss == 7800.0
+        # 1 SL × ₹1,950 = ₹1,950
+        assert max_loss == 1950.0
 
 
 class TestSummary:
@@ -370,10 +386,12 @@ class TestSummary:
     
     def test_get_summary(self):
         """Test summary generation."""
-        rm = create_test_risk_manager()
+        rm = create_test_risk_manager(max_sl_per_day=3)  # Allow more SLs
         
         rm.record_trade(5000, 20.0, "tsl_exit")
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        for _ in range(15): rm.tick_cooldown()
+        
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         # Clear cooldown
         for _ in range(30):
@@ -384,18 +402,19 @@ class TestSummary:
         assert summary["trades_today"] == 2
         assert summary["sl_hits_today"] == 1
         assert summary["sl_remaining"] == 2
-        assert summary["daily_pnl"] == 2400.0
+        assert summary["daily_pnl"] == 3050.0  # 5000 - 1950
         assert summary["wins"] == 1
         assert summary["losses"] == 1
         assert summary["win_rate"] == 50.0
-        assert summary["position_size"] == 260
+        assert summary["position_size"] == 390  # v2.0: 6 lots
     
     def test_daily_reset(self):
         """Test daily reset."""
-        rm = create_test_risk_manager()
+        rm = create_test_risk_manager(max_sl_per_day=3)
         
-        rm.record_trade(-2600, -10.0, "sl_hit")
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        rm.record_trade(-1950, -5.0, "sl_hit")
+        for _ in range(30): rm.tick_cooldown()
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         rm.reset_daily()
         
@@ -415,23 +434,93 @@ class TestEventCallbacks:
         events_received = []
         rm.add_event_callback(lambda e, s: events_received.append(e))
         
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         assert RiskEvent.SL_HIT in events_received
         assert RiskEvent.COOLDOWN_START in events_received
     
     def test_max_sl_callback(self):
-        """Test max SL reached callback."""
-        rm = create_test_risk_manager()
+        """Test max SL reached callback (Sniper Mode: 1 SL)."""
+        rm = create_test_risk_manager(max_sl_per_day=1)
         
         events_received = []
         rm.add_event_callback(lambda e, s: events_received.append(e))
         
-        rm.record_trade(-2600, -10.0, "sl_hit")
-        rm.record_trade(-2600, -10.0, "sl_hit")
-        rm.record_trade(-2600, -10.0, "sl_hit")
+        # Just 1 SL should trigger MAX_SL_REACHED
+        rm.record_trade(-1950, -5.0, "sl_hit")
         
         assert RiskEvent.MAX_SL_REACHED in events_received
+
+
+class TestProductionFeatures:
+    """Test v2.0 production-specific features."""
+    
+    def test_halt_trading(self):
+        """Test emergency halt functionality."""
+        rm = create_test_risk_manager()
+        
+        rm.halt_trading("Market crash!")
+        
+        assert rm.status.halted == True
+        assert rm.can_trade == False
+        assert "HALTED" in rm.status.block_reason
+    
+    def test_resume_trading(self):
+        """Test resume after halt."""
+        rm = create_test_risk_manager()
+        
+        rm.halt_trading("Test halt")
+        rm.resume_trading()
+        
+        assert rm.status.halted == False
+        # Should be tradeable again (no other blockers)
+        assert rm.can_trade == True
+    
+    def test_daily_loss_pct_limit(self):
+        """Test daily loss percentage limit."""
+        rm = create_test_risk_manager(
+            max_daily_loss_pct=5.0,
+            capital=100000.0,
+            max_sl_per_day=10  # High to not trigger SL limit
+        )
+        
+        # 5% of 1L = ₹5,000 loss
+        rm.record_trade(-5000, -20.0, "sl_hit")
+        for _ in range(30): rm.tick_cooldown()
+        
+        can_trade, reason = rm.can_enter_trade()
+        
+        assert can_trade == False
+        assert "Capital protection" in reason or "loss" in reason.lower()
+    
+    def test_position_tracking(self):
+        """Test position status tracking."""
+        rm = create_test_risk_manager()
+        
+        rm.set_in_position(True)
+        rm.update_position_pnl(500.0)
+        
+        assert rm.status.in_position == True
+        assert rm.status.unrealized_pnl == 500.0
+        
+        rm.set_in_position(False)
+        
+        assert rm.status.in_position == False
+        assert rm.status.unrealized_pnl == 0.0
+    
+    def test_drawdown_tracking(self):
+        """Test max drawdown tracking."""
+        rm = create_test_risk_manager(max_sl_per_day=5)
+        
+        # Win first
+        rm.record_trade(5000, 20.0, "tsl_exit")
+        for _ in range(15): rm.tick_cooldown()
+        
+        # Then lose - creates drawdown
+        rm.record_trade(-2000, -8.0, "sl_hit")
+        
+        assert rm.status.peak_pnl == 5000.0
+        assert rm.status.max_drawdown == 2000.0  # From peak 5000 to 3000
 
 
 if __name__ == "__main__":
