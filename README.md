@@ -1,4 +1,4 @@
-# N-Structure Algorithmic Trading Bot v5.2
+# N-Structure Algorithmic Trading Bot v5.3
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Status: Production Ready](https://img.shields.io/badge/Status-Production_Ready-green.svg)]()
@@ -29,7 +29,7 @@ HL2 HL1  ← Confirmation ────────────→ BUY!
 
 ---
 
-## 🔥 Features (v5.2)
+## 🔥 Features (v5.3)
 
 | Feature | Description |
 |---------|-------------|
@@ -39,23 +39,21 @@ HL2 HL1  ← Confirmation ────────────→ BUY!
 | **Sniper Mode** | 1 SL/day = Day Over (capital protection) |
 | **Structure TSL** | Trail to swing lows, not just candle lows |
 | **Dynamic Strike** | Select strike AFTER N-Structure confirmed |
+| **Network Retry** | Auto-wait on connection errors (infinite retry) |
+| **8pt SL** | Safer stop loss (was 5pt) |
 
 ---
 
 ## 📊 Position Sizing Profiles
 
-| Mode | Lots | Qty | Risk/Trade | Daily Loss | Capital |
-|------|------|-----|------------|------------|---------|
-| 🟢 Conservative | 4 | 260 | ₹1,300 | ₹1,300 | ₹30K |
-| 🟡 **Moderate** | 6 | 390 | ₹1,950 | ₹1,950 | ₹50K |
-| 🔴 Aggressive | 8 | 520 | ₹2,600 | ₹2,600 | ₹75K |
-| 🔥 Ultra | 12 | 780 | ₹3,900 | ₹3,900 | ₹1L+ |
+| Mode | Lots | Qty | Risk/Trade | SL Points | Capital |
+|------|------|-----|------------|-----------|---------|
+| 🟢 **Conservative** | 4 | 260 | ₹2,080 | 8pt | ₹30K |
+| 🟡 Moderate | 6 | 390 | ₹3,120 | 8pt | ₹50K |
+| 🔴 Aggressive | 8 | 520 | ₹4,160 | 8pt | ₹75K |
+| 🔥 Ultra | 12 | 780 | ₹6,240 | 8pt | ₹1L+ |
 
-**Change in `config/settings.yaml`:**
-```yaml
-risk:
-  position_mode: "moderate"  # conservative | moderate | aggressive | ultra
-```
+**Current: Conservative (4 lots, 8pt SL)**
 
 ---
 
@@ -63,116 +61,57 @@ risk:
 
 ```
 N/
-├── 📁 config/
-│   └── settings.yaml           # All strategy parameters
-│
-├── 📁 src/                     # Source code
+├── config/settings.yaml        # All strategy parameters
+├── src/                        # Source code (40 Python files)
 │   ├── main.py                 # Main trading bot
-│   ├── backtest/               # Backtesting engine
-│   ├── broker/                 # Angel One API
-│   ├── core/                   # State machine & storage
-│   ├── data/                   # Market data handling
+│   ├── broker/auth.py          # Angel One API + retry
+│   ├── core/                   # FSM, State Store, Risk
+│   ├── data/                   # Market feed, Candles, Strikes
 │   ├── execution/              # Order & SL management
-│   ├── indicators/             # EMA, N-Structure, Filters
+│   ├── indicators/             # N-Structure, EMA, Filters
 │   ├── risk/                   # Risk Manager v2.0
-│   ├── strategies/             # Strategy implementations
-│   └── utils/                  # Logging, Telegram
-│
-├── 📁 scripts/
-│   ├── backtest/               # All backtest scripts
-│   ├── paper_trade.py          # Paper trading script
-│   ├── start_live.sh           # Start live trading
-│   └── start_paper.sh          # Start paper trading
-│
-├── 📁 tests/                   # 98 unit tests
-│   ├── test_filters.py
-│   ├── test_risk_manager.py
-│   ├── test_sl_manager.py
-│   └── test_state_machine.py
-│
-├── 📁 docs/
-│   ├── LIVE_TRADING_CHECKLIST.md
-│   ├── RISK_MANAGEMENT.md
-│   ├── archive/                # Old session docs
-│   └── research/               # Strategy research
-│
-├── 📁 data/
-│   ├── cache/                  # Instrument cache
-│   └── instruments/            # Daily instrument files
-│
-├── 📁 logs/                    # Daily trading logs
-│
-├── .env                        # API credentials (not in git)
-├── .env.example                # Credential template
-├── requirements.txt            # Python dependencies
-└── README.md                   # This file
+│   └── utils/                  # Logger, Telegram
+├── scripts/backtest/           # Backtest scripts
+├── tests/                      # 98 unit tests
+├── data/                       # Cache, State DB
+├── logs/                       # Daily logs
+├── start.sh                    # Animated launcher
+└── requirements.txt            # 38 packages
 ```
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Setup Environment
 ```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate   # Windows
-
-# Install dependencies
+# Setup
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
+cp .env.example .env && nano .env
 
-### 2. Configure Credentials
-```bash
-# Copy example and fill in your Angel One API credentials
-cp .env.example .env
-nano .env
-```
+# Run Paper Trading
+./start.sh
 
-### 3. Configure Strategy
-```bash
-# Edit config/settings.yaml
-# Set position_mode, trading times, etc.
-nano config/settings.yaml
-```
-
-### 4. Run Paper Trading
-```bash
-python src/main.py --paper --polling
-```
-
-### 5. Run Live Trading (after testing)
-```bash
+# Run Live Trading
 python src/main.py --polling
 ```
 
 ---
 
-## ⚙️ Key Configuration
+## ⚙️ Key Configuration (v5.3)
 
 ```yaml
-# config/settings.yaml
-
-strategy:
-  version: "5.2.0"
-
-indicators:
-  n_structure:
-    confirmation_candles: 2        # Wait 2 candles
-    require_direction_candle: true # Must be directional
-    volume_confirmation_enabled: true
-    gap_filter_enabled: true
+exit:
+  initial_sl_points: 8.0           # Safer SL
 
 risk:
-  position_mode: "moderate"
-  max_sl_per_day: 1               # SNIPER MODE
-  sl_points: 5.0
+  position_mode: "conservative"    # 4 lots
+  max_sl_per_day: 1                # SNIPER MODE
+  sl_points: 8.0
 
 timing:
-  trading_start: "09:50"
-  no_new_trades_after: "14:30"    # Extended for testing
-  manage_till: "14:40"
+  trading_start: "09:30"           # After first 15 mins
+  no_new_trades_after: "14:30"
 ```
 
 ---
@@ -180,25 +119,8 @@ timing:
 ## 🧪 Run Tests
 
 ```bash
-# All tests
-python -m pytest tests/ -v
-
-# Specific test file
-python -m pytest tests/test_risk_manager.py -v
+python -m pytest tests/ -v  # 98 passing
 ```
-
----
-
-## 📈 Risk Management v2.0
-
-**Protection Layers (checked in order):**
-1. 🛑 **Emergency Halt** - Manual override
-2. ⏰ **Time Window** - No trades before 9:50 or after 14:30
-3. 🎯 **SNIPER MODE** - Max 1 SL hit per day
-4. 💰 **Daily Loss Limit** - Absolute ₹ limit
-5. 📉 **Capital Protection** - Max 5% loss
-6. 📊 **Max Trades** - Safety cap (10/day)
-7. ⏳ **Cooldown** - After each trade
 
 ---
 
@@ -206,18 +128,16 @@ python -m pytest tests/test_risk_manager.py -v
 
 | Version | Date | Changes |
 |---------|------|---------|
+| **v5.3.0** | Feb 23, 2026 | 8pt SL, 4 lots, 9:30 start, cleanup |
 | v5.2.0 | Feb 2026 | Confirmation Candle, Risk Manager v2.0 |
 | v5.1.0 | Feb 2026 | Volume Filter, Gap Filter |
 | v5.0.0 | Jan 2026 | Pullback Entry, Dual Direction |
-| v1.2.0 | Jan 2026 | HH Breakout Re-entry |
-| v1.1.0 | Jan 2026 | Structure-based TSL |
-| v1.0.0 | Jan 2026 | Initial release |
 
 ---
 
 ## ⚠️ Disclaimer
 
-This software is for educational purposes only. Trading involves significant risk of loss. Past performance does not guarantee future results. Use at your own risk.
+This software is for educational purposes only. Trading involves significant risk.
 
 ---
 
