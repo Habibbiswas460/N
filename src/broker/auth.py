@@ -98,20 +98,39 @@ class AngelOneAuth:
         totp = pyotp.TOTP(self.totp_secret)
         return totp.now()
     
+    def _is_connection_error(self, error: Exception) -> bool:
+        """Check if error is a network/connection error."""
+        error_str = str(error).lower()
+        connection_keywords = [
+            'name resolution', 'connection', 'timeout', 'network',
+            'unreachable', 'refused', 'reset', 'dns', 'resolve'
+        ]
+        return any(kw in error_str for kw in connection_keywords)
+    
     def login(self, max_retries: int = 3, retry_delay: float = 2.0) -> bool:
         """
         Login to Angel One SmartAPI.
         
         Args:
-            max_retries: Maximum login attempts
+            max_retries: Maximum login attempts (for non-connection errors)
             retry_delay: Delay between retries in seconds
             
         Returns:
             True if login successful, False otherwise
+            
+        Note:
+            Connection errors will retry indefinitely with 30s delay.
+            Only authentication errors count against max_retries.
         """
-        for attempt in range(max_retries):
+        auth_attempts = 0  # Only count auth failures, not connection errors
+        connection_retry_delay = 30  # Wait 30 seconds for connection errors
+        
+        while True:
             try:
-                logger.info(f"Login attempt {attempt + 1}/{max_retries}")
+                if auth_attempts > 0:
+                    logger.info(f"Login attempt {auth_attempts + 1}/{max_retries}")
+                else:
+                    logger.info("Login attempt 1/3")
                 
                 # Create new SmartConnect instance
                 self._smart_api = SmartConnect(api_key=self.api_key)
@@ -146,16 +165,28 @@ class AngelOneAuth:
                 else:
                     error_msg = login_response.get("message", "Unknown error")
                     logger.warning(f"Login failed: {error_msg}")
+                    auth_attempts += 1
                     
             except Exception as e:
-                logger.error(f"Login exception: {type(e).__name__}: {e}")
+                error_str = str(e)
                 
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
+                # Check if it's a connection error
+                if self._is_connection_error(e):
+                    logger.warning(f"⚠️ No internet connection: {type(e).__name__}")
+                    logger.info(f"⏳ Waiting {connection_retry_delay}s for network... (will retry indefinitely)")
+                    time.sleep(connection_retry_delay)
+                    continue  # Don't count as auth failure, keep trying
+                else:
+                    logger.error(f"Login exception: {type(e).__name__}: {e}")
+                    auth_attempts += 1
+            
+            # Check if we've exceeded auth attempts (not connection attempts)
+            if auth_attempts >= max_retries:
+                logger.error("All login attempts failed")
+                return False
                 
-        logger.error("All login attempts failed")
-        return False
+            logger.info(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
     
     def refresh_token(self) -> bool:
         """
@@ -288,7 +319,7 @@ class AngelOneAuth:
             
         return None
     
-    def get_ltp(self, exchange: str, symbol: str, token: str) -> Optional[float]:
+    def get_ltp(self, exchange: str, symbol: str, token: str, retry_on_connection_error: bool = True) -> Optional[float]:
         """
         Get Last Traded Price for a symbol.
         
@@ -296,27 +327,37 @@ class AngelOneAuth:
             exchange: Exchange (NSE, NFO, etc.)
             symbol: Trading symbol
             token: Instrument token
+            retry_on_connection_error: Keep retrying on network errors
             
         Returns:
             LTP if successful, None otherwise
         """
         if not self.ensure_valid_session():
             return None
-            
-        try:
-            data = self._smart_api.ltpData(exchange, symbol, token)
-            logger.debug(f"Raw LTP response: {data}")
-            if data.get("status"):
-                ltp_data = data.get("data", {})
-                ltp = float(ltp_data.get("ltp", 0))
-                logger.debug(f"Extracted LTP: {ltp}")
-                return ltp
-            else:
-                logger.warning(f"LTP fetch failed: {data.get('message')}")
-        except Exception as e:
-            logger.error(f"LTP fetch exception: {e}")
-            
-        return None
+        
+        retry_delay = 30  # Wait 30 seconds on connection error
+        
+        while True:
+            try:
+                data = self._smart_api.ltpData(exchange, symbol, token)
+                logger.debug(f"Raw LTP response: {data}")
+                if data.get("status"):
+                    ltp_data = data.get("data", {})
+                    ltp = float(ltp_data.get("ltp", 0))
+                    logger.debug(f"Extracted LTP: {ltp}")
+                    return ltp
+                else:
+                    logger.warning(f"LTP fetch failed: {data.get('message')}")
+                    return None
+            except Exception as e:
+                if retry_on_connection_error and self._is_connection_error(e):
+                    logger.warning(f"⚠️ Network error fetching LTP: {type(e).__name__}")
+                    logger.info(f"⏳ Waiting {retry_delay}s for network... (will retry)")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error(f"LTP fetch exception: {e}")
+                    return None
     
     def get_multiple_ltp(self, symbols: list) -> dict:
         """
@@ -332,39 +373,48 @@ class AngelOneAuth:
             return {}
             
         result = {}
+        retry_delay = 30
         
         # Angel One API allows batch LTP - use it
-        try:
-            # Format: {"exchange": "NSE", "tradingsymbol": "SBIN-EQ", "symboltoken": "3045"}
-            exchange_tokens = {}
-            for s in symbols:
-                exchange = s.get("exchange", "NFO")
-                token = s.get("token")
-                if exchange not in exchange_tokens:
-                    exchange_tokens[exchange] = []
-                exchange_tokens[exchange].append(token)
-            
-            # Call API for each exchange
-            for exchange, tokens in exchange_tokens.items():
-                data = self._smart_api.getMarketData(
-                    mode="LTP",
-                    exchangeTokens={exchange: tokens}
-                )
+        while True:
+            try:
+                # Format: {"exchange": "NSE", "tradingsymbol": "SBIN-EQ", "symboltoken": "3045"}
+                exchange_tokens = {}
+                for s in symbols:
+                    exchange = s.get("exchange", "NFO")
+                    token = s.get("token")
+                    if exchange not in exchange_tokens:
+                        exchange_tokens[exchange] = []
+                    exchange_tokens[exchange].append(token)
                 
-                if data.get("status"):
-                    fetched = data.get("data", {}).get("fetched", [])
-                    for item in fetched:
-                        tok = item.get("symbolToken")
-                        ltp = item.get("ltp")
-                        if tok and ltp:
-                            result[tok] = float(ltp)
-                else:
-                    logger.warning(f"Batch LTP failed for {exchange}: {data.get('message')}")
+                # Call API for each exchange
+                for exchange, tokens in exchange_tokens.items():
+                    data = self._smart_api.getMarketData(
+                        mode="LTP",
+                        exchangeTokens={exchange: tokens}
+                    )
                     
-        except Exception as e:
-            logger.error(f"Batch LTP exception: {e}")
-            
-        return result
+                    if data.get("status"):
+                        fetched = data.get("data", {}).get("fetched", [])
+                        for item in fetched:
+                            tok = item.get("symbolToken")
+                            ltp = item.get("ltp")
+                            if tok and ltp:
+                                result[tok] = float(ltp)
+                    else:
+                        logger.warning(f"Batch LTP failed for {exchange}: {data.get('message')}")
+                
+                return result  # Success, return result
+                        
+            except Exception as e:
+                if self._is_connection_error(e):
+                    logger.warning(f"⚠️ Network error fetching batch LTP: {type(e).__name__}")
+                    logger.info(f"⏳ Waiting {retry_delay}s for network... (will retry)")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error(f"Batch LTP exception: {e}")
+                    return result
 
 
 # Singleton instance for global access

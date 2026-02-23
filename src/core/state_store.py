@@ -108,10 +108,22 @@ class StateStore:
                     max_drawdown REAL DEFAULT 0,
                     consecutive_losses INTEGER DEFAULT 0,
                     signals_generated INTEGER DEFAULT 0,
+                    sl_hits INTEGER DEFAULT 0,
+                    reentries INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
+            # Migration: Add sl_hits and reentries columns if they don't exist
+            try:
+                cursor.execute("ALTER TABLE daily_stats ADD COLUMN sl_hits INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                cursor.execute("ALTER TABLE daily_stats ADD COLUMN reentries INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             
             # Trade log table (historical)
             cursor.execute("""
@@ -364,8 +376,40 @@ class StateStore:
                 'total_pnl': 0,
                 'max_drawdown': 0,
                 'consecutive_losses': 0,
-                'signals_generated': 0
+                'signals_generated': 0,
+                'sl_hits': 0,
+                'reentries': 0
             }
+    
+    def update_sl_hits(self, date: datetime = None) -> None:
+        """Increment SL hits counter for the day."""
+        date = date or datetime.now()
+        date_str = date.strftime("%Y-%m-%d")
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            self.get_daily_stats(date)  # Ensure row exists
+            cursor.execute("""
+                UPDATE daily_stats
+                SET sl_hits = sl_hits + 1, updated_at = ?
+                WHERE date = ?
+            """, (datetime.now(), date_str))
+            conn.commit()
+    
+    def update_reentries(self, date: datetime = None) -> None:
+        """Increment reentries counter for the day."""
+        date = date or datetime.now()
+        date_str = date.strftime("%Y-%m-%d")
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            self.get_daily_stats(date)  # Ensure row exists
+            cursor.execute("""
+                UPDATE daily_stats
+                SET reentries = reentries + 1, updated_at = ?
+                WHERE date = ?
+            """, (datetime.now(), date_str))
+            conn.commit()
     
     def update_daily_stats(
         self,
@@ -438,16 +482,60 @@ class StateStore:
     
     # === Cleanup ===
     
-    def reset_daily(self) -> None:
-        """Reset for new trading day."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM fsm_state")
-            cursor.execute("DELETE FROM n_structure")
-            cursor.execute("DELETE FROM active_trade")
-            conn.commit()
+    def reset_daily(self, force: bool = False) -> bool:
+        """
+        Reset state for new trading day with safety checks.
+        
+        Args:
+            force: If True, bypass safety checks (use with caution)
             
-        logger.info("Daily state reset complete")
+        Returns:
+            True if reset was performed, False if skipped due to safety
+        """
+        # Safety Check 1: Check for active trade
+        active_trade = self.get_active_trade()
+        if active_trade and not force:
+            logger.warning(
+                f"⚠️  RESET BLOCKED: Active trade exists! "
+                f"Symbol: {active_trade.get('option_symbol')}, "
+                f"Entry: ₹{active_trade.get('entry_price', 0):.2f}"
+            )
+            logger.warning("Use force=True to override, but this may cause data loss")
+            return False
+        
+        # Safety Check 2: Archive current state before reset
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Archive FSM state to log (for debugging)
+                cursor.execute("SELECT * FROM fsm_state LIMIT 1")
+                fsm_state = cursor.fetchone()
+                if fsm_state:
+                    logger.info(f"Archiving FSM state: {dict(fsm_state).get('state', 'unknown')}")
+                
+                # Archive n_structure count
+                cursor.execute("SELECT COUNT(*) FROM n_structure")
+                n_count = cursor.fetchone()[0]
+                if n_count > 0:
+                    logger.info(f"Archiving {n_count} N-structure patterns")
+                
+                # Perform reset
+                cursor.execute("DELETE FROM fsm_state")
+                cursor.execute("DELETE FROM n_structure")
+                cursor.execute("DELETE FROM active_trade")
+                conn.commit()
+                
+            logger.info("✓ Daily state reset complete")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Daily reset failed: {e}")
+            return False
+    
+    def has_active_trade(self) -> bool:
+        """Check if there's an active trade (for safety checks)."""
+        return self.get_active_trade() is not None
         
     def close(self) -> None:
         """Close any open connections."""

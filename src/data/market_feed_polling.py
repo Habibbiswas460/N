@@ -100,7 +100,7 @@ class PollingMarketFeed:
         self._network_down = False
         self._last_success_time: Optional[datetime] = None
         self._reconnect_attempts = 0
-        self._max_reconnect_attempts = 50  # Stop retrying after this many attempts
+        self._max_reconnect_attempts = 0  # 0 = infinite retries (never give up on connection errors)
         self._backoff_time = 5.0  # Exponential backoff start
         
     def add_tick_callback(self, callback: TickCallback) -> None:
@@ -175,8 +175,8 @@ class PollingMarketFeed:
                                 logger.warning(f"⚠️ Network appears DOWN - {self._consecutive_errors} consecutive errors")
                                 self._network_down = True
                             
-                            # Check if we've exceeded max reconnect attempts
-                            if self._reconnect_attempts >= self._max_reconnect_attempts:
+                            # Check if we've exceeded max reconnect attempts (0 = infinite)
+                            if self._max_reconnect_attempts > 0 and self._reconnect_attempts >= self._max_reconnect_attempts:
                                 logger.error(f"❌ MAX RETRIES EXCEEDED ({self._max_reconnect_attempts}) - Stopping polling")
                                 self._is_running = False
                                 break

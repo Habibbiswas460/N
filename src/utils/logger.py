@@ -1,8 +1,8 @@
 """
-Logging Utilities Module
+Logging Utilities Module - Pro Trading Style
 
-Structured logging with Loguru for trading bot.
-Provides separate log files for different event types.
+Clean, professional logging for live trading.
+Minimal noise, maximum signal.
 """
 
 import sys
@@ -14,6 +14,54 @@ from typing import Optional, Dict, Any
 from loguru import logger
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CUSTOM LOG FORMATS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _format_console(record):
+    """Pro-style console format with dynamic colors."""
+    level = record["level"].name
+    
+    # Color mapping - use simple colors, avoid nested bold
+    colors = {
+        "DEBUG": "dim",
+        "INFO": "white", 
+        "SUCCESS": "green",
+        "WARNING": "yellow",
+        "ERROR": "red",
+        "CRITICAL": "white"
+    }
+    color = colors.get(level, "white")
+    
+    # Compact time
+    time_str = record["time"].strftime("%H:%M:%S")
+    
+    # Level symbols (cleaner than text)
+    symbols = {
+        "DEBUG": "·",
+        "INFO": "│",
+        "SUCCESS": "✓",
+        "WARNING": "⚠",
+        "ERROR": "✗",
+        "CRITICAL": "☠"
+    }
+    symbol = symbols.get(level, "│")
+    
+    # Format based on message type
+    msg = record["message"]
+    
+    # Special formatting for candle logs (condense them)
+    if "Candle" in msg and ("Index:" in msg or "Option" in msg):
+        return f"<dim>{time_str}</dim> <cyan>{symbol}</cyan> {msg}\n"
+    
+    # Trade execution - highlight
+    if any(x in msg for x in ["TRADE EXECUTED", "ENTRY", "EXIT", "SL HIT"]):
+        return f"<{color}>{time_str} {symbol}</{color}> {msg}\n"
+    
+    # Default format
+    return f"<dim>{time_str}</dim> <{color}>{symbol}</{color}> {msg}\n"
+
+
 def setup_logging(
     log_dir: str = "data/logs",
     level: str = "INFO",
@@ -21,17 +69,11 @@ def setup_logging(
     retention: str = "7 days"
 ) -> None:
     """
-    Configure logging for the trading bot.
-    
-    Creates separate log files:
-    - trading.log: Main application log
-    - signals.jsonl: Trading signals (JSON Lines)
-    - orders.jsonl: Order events (JSON Lines)
-    - states.jsonl: FSM state transitions (JSON Lines)
+    Configure pro-style logging for trading bot.
     
     Args:
         log_dir: Directory for log files
-        level: Logging level (DEBUG, INFO, WARNING, ERROR)
+        level: Logging level
         rotation: Log rotation interval
         retention: Log retention period
     """
@@ -41,39 +83,118 @@ def setup_logging(
     # Remove default handler
     logger.remove()
     
-    # Console handler with color
+    # Pro console handler - clean & minimal
     logger.add(
         sys.stderr,
         level=level,
-        format=(
-            "<green>{time:HH:mm:ss}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-            "<level>{message}</level>"
-        ),
+        format=_format_console,
         colorize=True
     )
     
-    # Main log file
+    # Main log file - detailed for analysis
     logger.add(
         log_path / "trading.log",
         level=level,
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
+        format="{time:HH:mm:ss} | {level: <7} | {message}",
         rotation=rotation,
         retention=retention,
         compression="gz"
     )
     
-    # Error log file (errors only)
+    # Error log - critical issues only
     logger.add(
         log_path / "errors.log",
         level="ERROR",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} | {message}",
         rotation=rotation,
         retention=retention
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRO LOGGING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def log_banner(title: str, char: str = "═") -> None:
+    """Print a banner line for visual separation."""
+    width = 60
+    logger.opt(colors=True).info(f"<cyan>{char * width}</cyan>")
+    logger.opt(colors=True).info(f"<white>  {title.upper()}</white>")
+    logger.opt(colors=True).info(f"<cyan>{char * width}</cyan>")
+
+
+def log_trade_entry(symbol: str, price: float, qty: int, sl: float, direction: str) -> None:
+    """Log trade entry in pro style."""
+    emoji = "📈" if direction == "CE" else "📉"
+    logger.opt(colors=True).success(
+        f"\n{'═' * 50}\n"
+        f"<green>{emoji} TRADE ENTRY</green>\n"
+        f"{'─' * 50}\n"
+        f"  Symbol    : <cyan>{symbol}</cyan>\n"
+        f"  Direction : <yellow>{direction}</yellow>\n"
+        f"  Entry     : ₹{price:.2f}\n"
+        f"  Quantity  : {qty}\n"
+        f"  Stop Loss : <red>₹{sl:.2f}</red>\n"
+        f"{'═' * 50}"
+    )
+
+
+def log_trade_exit(symbol: str, entry: float, exit_price: float, qty: int, pnl: float, reason: str) -> None:
+    """Log trade exit in pro style."""
+    is_profit = pnl >= 0
+    emoji = "✅" if is_profit else "❌"
+    color = "green" if is_profit else "red"
+    sign = "+" if is_profit else ""
     
-    logger.info(f"Logging initialized: {log_path}")
+    logger.opt(colors=True).log(
+        "SUCCESS" if is_profit else "WARNING",
+        f"\n{'═' * 50}\n"
+        f"<{color}>{emoji} TRADE EXIT - {reason.upper()}</{color}>\n"
+        f"{'─' * 50}\n"
+        f"  Symbol : <cyan>{symbol}</cyan>\n"
+        f"  Entry  : ₹{entry:.2f}\n"
+        f"  Exit   : ₹{exit_price:.2f}\n"
+        f"  Qty    : {qty}\n"
+        f"  P&L    : <{color}>{sign}₹{pnl:,.0f}</{color}>\n"
+        f"{'═' * 50}"
+    )
+
+
+def log_candle(time_str: str, index: float, option: float, opt_type: str = "CE") -> None:
+    """Log candle in compact format."""
+    logger.info(f"🕯 {time_str} │ Nifty: {index:,.2f} │ {opt_type}: ₹{option:.2f}")
+
+
+def log_signal(signal_type: str, details: str) -> None:
+    """Log trading signal."""
+    colors = {
+        "BULLISH": "green",
+        "BEARISH": "red",
+        "NEUTRAL": "yellow"
+    }
+    color = colors.get(signal_type.upper(), "white")
+    logger.opt(colors=True).info(f"<{color}>◉ {signal_type}</{color}> {details}")
+
+
+def log_risk_alert(message: str) -> None:
+    """Log risk management alert."""
+    logger.opt(colors=True).warning(f"<yellow>⚠ RISK</yellow> {message}")
+
+
+def log_system(message: str) -> None:
+    """Log system message."""
+    logger.opt(colors=True).info(f"<dim>▸ {message}</dim>")
+
+
+def log_startup_banner(version: str = "1.0") -> None:
+    """Print startup banner."""
+    logger.opt(colors=True).info(
+        f"\n<cyan>{'═' * 60}</cyan>\n"
+        f"<white>   N-STRUCTURE TRADING BOT v{version}</white>\n"
+        f"<cyan>{'─' * 60}</cyan>\n"
+        f"<dim>   Algorithmic Options Trading System</dim>\n"
+        f"<cyan>{'═' * 60}</cyan>\n"
+    )
 
 
 class StructuredLogger:
@@ -316,7 +437,7 @@ class StructuredLogger:
         event_type: str,
         daily_pnl: float,
         trades_today: int,
-        consecutive_losses: int,
+        sl_hits: int,
         can_trade: bool,
         reason: str = ""
     ) -> None:
@@ -327,7 +448,7 @@ class StructuredLogger:
             event_type: Event type (warning, blocked, etc.)
             daily_pnl: Daily P&L
             trades_today: Trades taken today
-            consecutive_losses: Consecutive loss count
+            sl_hits: Stop-loss hits today
             can_trade: Whether trading is allowed
             reason: Additional reason
         """
@@ -336,7 +457,7 @@ class StructuredLogger:
             "type": event_type,
             "daily_pnl": daily_pnl,
             "trades_today": trades_today,
-            "consecutive_losses": consecutive_losses,
+            "sl_hits": sl_hits,
             "can_trade": can_trade,
             "reason": reason,
             "timestamp": datetime.now().isoformat()

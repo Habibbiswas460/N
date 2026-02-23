@@ -282,11 +282,12 @@ class TimeFilter:
             phase = "ACTIVE"
             is_optimal = current_time >= self.optimal_start
             message = "Prime trading window" if is_optimal else "Approaching optimal window"
-        elif current_time < time(13, 30):
+        elif current_time <= self.no_new_trades_after:
+            # Midday trading - ALLOW new trades until no_new_trades_after
             phase = "MIDDAY"
-            is_optimal = current_time <= self.no_new_trades_after
-            message = "Midday trading - reduced conviction" if is_optimal else "Avoid new trades"
-        elif current_time < time(14, 40):
+            is_optimal = True  # Allow trades during this window
+            message = "Active trading window"
+        elif current_time < time(15, 15):
             phase = "CLOSING"
             is_optimal = False
             message = "Position management only"
@@ -316,7 +317,8 @@ class CompositeFilter:
         enable_trend_filter: bool = True,
         enable_time_filter: bool = True,
         volume_lookback: int = 20,
-        min_volume_ratio: float = 0.8
+        min_volume_ratio: float = 0.8,
+        no_new_trades_after: time = time(14, 30)  # Default 14:30
     ):
         """
         Initialize composite filter.
@@ -327,6 +329,7 @@ class CompositeFilter:
             enable_time_filter: Whether to use time filter
             volume_lookback: Lookback for volume average
             min_volume_ratio: Minimum volume ratio
+            no_new_trades_after: Time after which no new trades
         """
         self.enable_volume_filter = enable_volume_filter
         self.enable_trend_filter = enable_trend_filter
@@ -338,7 +341,9 @@ class CompositeFilter:
         ) if enable_volume_filter else None
         
         self.trend_filter = TrendFilter() if enable_trend_filter else None
-        self.time_filter = TimeFilter() if enable_time_filter else None
+        self.time_filter = TimeFilter(
+            no_new_trades_after=no_new_trades_after
+        ) if enable_time_filter else None
         
     def check_all(
         self,

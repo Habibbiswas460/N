@@ -765,7 +765,8 @@ def initialize_sl_manager(
     safe_mode_buffer: float = 1.0,        # SL = Entry + 1pt
     trail_mode_trigger: float = 10.0,     # Trail mode at +10pt
     trail_mode_buffer: float = 5.0,       # TSL = High - 5pt
-    enable_sniper_mode: bool = True       # Enable sniper mode
+    enable_sniper_mode: bool = True,      # Enable sniper mode
+    order_manager: Optional[OrderManager] = None  # Shared order manager (paper mode aware)
 ) -> StopLossManager:
     """
     Initialize SL manager with v2.0 Sniper Mode configuration.
@@ -787,6 +788,7 @@ def initialize_sl_manager(
     """
     global _sl_manager
     _sl_manager = StopLossManager(
+        order_manager=order_manager,  # Pass the shared order manager (paper mode aware)
         initial_sl_points=initial_sl_points,
         breakeven_trigger_points=breakeven_trigger_points,
         tsl_buffer=tsl_buffer,

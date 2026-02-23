@@ -171,7 +171,7 @@ risk:
 
 timing:
   trading_start: "09:50"
-  no_new_trades_after: "12:30"
+  no_new_trades_after: "14:30"    # Extended for testing
   manage_till: "14:40"
 ```
 
@@ -193,7 +193,7 @@ python -m pytest tests/test_risk_manager.py -v
 
 **Protection Layers (checked in order):**
 1. 🛑 **Emergency Halt** - Manual override
-2. ⏰ **Time Window** - No trades before 9:50 or after 12:30
+2. ⏰ **Time Window** - No trades before 9:50 or after 14:30
 3. 🎯 **SNIPER MODE** - Max 1 SL hit per day
 4. 💰 **Daily Loss Limit** - Absolute ₹ limit
 5. 📉 **Capital Protection** - Max 5% loss

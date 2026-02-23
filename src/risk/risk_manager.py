@@ -770,7 +770,7 @@ def initialize_risk_manager(
     max_daily_loss_pct: float = 5.0,
     max_trades_per_day: int = 10,
     trading_start: str = "09:50",
-    no_new_after: str = "12:30",
+    no_new_after: str = "14:30",  # Match config/settings.yaml
     manage_till: str = "14:40",
     enable_time_filter: bool = True,
     margin_per_lot: float = 15000.0
@@ -791,7 +791,7 @@ def initialize_risk_manager(
         max_daily_loss_pct: Max daily loss as % of capital (default: 5%)
         max_trades_per_day: Max trades per day (default: 10)
         trading_start: Trading start time (default: "09:50")
-        no_new_after: No new trades after (default: "12:30")
+        no_new_after: No new trades after (default: "14:30")
         manage_till: Manage positions till (default: "14:40")
         enable_time_filter: Enable time restrictions (default: True)
         margin_per_lot: Margin required per lot (default: ₹15,000)

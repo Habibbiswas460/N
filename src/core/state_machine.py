@@ -57,6 +57,7 @@ class StateContext:
     entry_price: float = 0.0
     current_sl: float = 0.0
     position_pnl: float = 0.0
+    quantity: int = 0  # Position quantity
     
     # Timing
     last_state_change: datetime = field(default_factory=datetime.now)
@@ -83,6 +84,7 @@ class StateContext:
             'entry_price': self.entry_price,
             'current_sl': self.current_sl,
             'position_pnl': self.position_pnl,
+            'quantity': self.quantity,
             'divergence_confirmed': self.divergence_confirmed,
             'breakeven_hit': self.breakeven_hit,
             'last_state_change': self.last_state_change.isoformat() if self.last_state_change else None,
@@ -106,6 +108,7 @@ class StateContext:
         ctx.entry_price = data.get('entry_price', 0.0)
         ctx.current_sl = data.get('current_sl', 0.0)
         ctx.position_pnl = data.get('position_pnl', 0.0)
+        ctx.quantity = data.get('quantity', 0)
         ctx.divergence_confirmed = data.get('divergence_confirmed', False)
         ctx.breakeven_hit = data.get('breakeven_hit', False)
         
@@ -240,6 +243,15 @@ class TradingStateMachine:
         if saved:
             try:
                 state_name = saved.get('state', 'IDLE')
+                
+                # Handle legacy state names (backwards compatibility)
+                legacy_state_map = {
+                    'FLAT': 'IDLE',
+                    'WAITING': 'WATCHING_BREAKOUT',
+                    'ACTIVE': 'IN_POSITION',
+                }
+                state_name = legacy_state_map.get(state_name, state_name)
+                
                 self._state = TradingState[state_name]
                 
                 data = saved.get('data', {})
@@ -712,17 +724,26 @@ class TradingStateMachine:
         
         # v2.0: PRIORITY - Universal READY_FOR_ENTRY handling (DualDirectionDetector)
         # Check this FIRST before any legacy state-based processing
-        if (self._state not in [TradingState.ARMED, TradingState.IN_POSITION, TradingState.PENDING_REENTRY] and
-            n_structure and n_structure.divergence_confirmed and n_structure.entry_trigger):
-            self._context.entry_trigger_price = n_structure.entry_trigger
-            self._context.divergence_confirmed = True
-            self._context.n_structure = n_structure
-            self.transition_to(
-                TradingState.ARMED,
-                f"N-Structure READY! Entry trigger: {n_structure.entry_trigger:.2f}"
-            )
+        # v5.3 FIX: Also update entry_trigger_price when ARMED but signal is confirmed
+        if n_structure and n_structure.divergence_confirmed and n_structure.entry_trigger:
+            # Update entry trigger even if already ARMED (may have been reset)
+            if self._context.entry_trigger_price == 0.0 or self._state == TradingState.IDLE:
+                self._context.entry_trigger_price = n_structure.entry_trigger
+                self._context.divergence_confirmed = True
+                self._context.n_structure = n_structure
+                logger.info(f"Entry trigger updated: {n_structure.entry_trigger:.2f}")
+            
+            # Transition to ARMED if not already in position/reentry
+            if self._state not in [TradingState.ARMED, TradingState.IN_POSITION, TradingState.PENDING_REENTRY]:
+                self.transition_to(
+                    TradingState.ARMED,
+                    f"N-Structure READY! Entry trigger: {n_structure.entry_trigger:.2f}"
+                )
             self._persist_state()
-            return  # Exit early - armed for entry
+            
+            # If ARMED with valid trigger, main.py will handle entry
+            if self._state == TradingState.ARMED and self._context.entry_trigger_price > 0:
+                return  # Exit early - ready for entry check in main.py
         
         # Handle states based on N-Structure detection (legacy path)
         if self._state == TradingState.IDLE:

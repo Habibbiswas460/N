@@ -171,6 +171,15 @@ class DynamicStrikeSelector:
         Returns:
             DynamicStrike if found, None otherwise
         """
+        # Ensure instrument master is loaded
+        if not self._master.is_loaded:
+            logger.info("📥 Loading instrument master for strike selection...")
+            self._master.download()
+            
+            if not self._master.is_loaded:
+                logger.error("❌ Failed to load instrument master!")
+                return None
+        
         # Determine option type based on signal direction
         if n_structure.direction == SignalDirection.BULLISH:
             option_type = OptionType.CALL

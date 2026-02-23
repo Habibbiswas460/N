@@ -21,6 +21,7 @@ from loguru import logger
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from utils import now_ist, today_ist, IST
 from broker.auth import AngelOneAuth
 from data.instrument_master import InstrumentMaster, OptionType
 from data.market_feed import MarketFeed, SubscriptionMode
@@ -32,11 +33,16 @@ from indicators.n_structure import NStructureDetector, NStructure, DualDirection
 from indicators.filters import CompositeFilter, VolumeAnalysis, TrendAnalysis
 from core.state_store import StateStore
 from core.state_machine import TradingStateMachine, TradingState, StateContext
+from core.risk_manager import PartialProfitManager, ExitType
 from execution.order_manager import OrderManager, OrderRequest, OrderType, TransactionType, ProductType
 from execution.sl_manager import StopLossManager, SLStatus, initialize_sl_manager
 from risk.risk_manager import RiskManager, RiskLimits, RiskEvent, initialize_risk_manager
 from risk.position_reconciler import PositionReconciler
-from utils.logger import setup_logging, get_structured_logger
+from utils.logger import (
+    setup_logging, get_structured_logger, 
+    log_banner, log_trade_entry, log_trade_exit, log_candle, 
+    log_signal, log_risk_alert, log_system, log_startup_banner
+)
 from utils.telegram import TelegramNotifier, initialize_telegram
 
 class TradingBot:
@@ -193,7 +199,7 @@ class TradingBot:
             max_daily_loss_pct=risk_config.get("max_daily_loss_pct", 5.0),
             max_trades_per_day=risk_config.get("max_trades_per_day", 10),
             trading_start=timing_config.get("trading_start", "09:50"),
-            no_new_after=timing_config.get("no_new_trades_after", "12:30"),
+            no_new_after=timing_config.get("no_new_trades_after", "14:30"),  # Match config
             manage_till=timing_config.get("manage_till", "14:40"),
             enable_time_filter=timing_config.get("enable_time_filter", True),
             margin_per_lot=risk_config.get("margin_per_lot", 15000.0)
@@ -236,7 +242,8 @@ class TradingBot:
             safe_mode_buffer=safe_mode_buffer,
             trail_mode_trigger=trail_mode_trigger,
             trail_mode_buffer=trail_mode_buffer,
-            enable_sniper_mode=enable_sniper
+            enable_sniper_mode=enable_sniper,
+            order_manager=self.order_manager  # Pass shared order manager (paper mode aware)
         )
         
         logger.info(
@@ -245,6 +252,31 @@ class TradingBot:
             f"Safe: +{safe_mode_trigger}pt→Entry+{safe_mode_buffer} | "
             f"Trail: +{trail_mode_trigger}pt→High-{trail_mode_buffer}"
         )
+        
+        # Initialize partial profit manager (v1.3)
+        partial_config = self.config.get("partial_profits", {})
+        self.partial_profit_enabled = partial_config.get("enabled", False)
+        self.partial_profit_manager: Optional[PartialProfitManager] = None
+        
+        if self.partial_profit_enabled:
+            t1_config = partial_config.get("first_target", {})
+            t2_config = partial_config.get("second_target", {})
+            risk_config = self.config.get("risk", {})
+            
+            self.partial_profit_manager = PartialProfitManager(
+                first_target_points=t1_config.get("trigger_points", 15.0),
+                first_exit_percentage=t1_config.get("exit_percentage", 50.0),
+                second_target_points=t2_config.get("trigger_points", 30.0),
+                second_exit_percentage=t2_config.get("exit_percentage", 25.0),
+                lot_size=risk_config.get("lot_size", 65)
+            )
+            logger.info(
+                f"Partial Profit Manager v1.3 | "
+                f"T1: +{t1_config.get('trigger_points', 15)}pt→{t1_config.get('exit_percentage', 50)}% | "
+                f"T2: +{t2_config.get('trigger_points', 30)}pt→{t2_config.get('exit_percentage', 25)}%"
+            )
+        else:
+            logger.info("Partial Profit Manager: DISABLED")
         
         # Initialize position reconciler
         self.reconciler = PositionReconciler(
@@ -285,16 +317,21 @@ class TradingBot:
         
         # Initialize Composite Filter (v1.3 - volume + trend + time)
         filter_config = self.config.get("filters", {})
+        timing_str = timing_config.get("no_new_trades_after", "14:30")
+        no_new_after_time = datetime.strptime(timing_str, "%H:%M").time()
+        
         self.composite_filter = CompositeFilter(
             enable_volume_filter=filter_config.get("enable_volume", True),
             enable_trend_filter=filter_config.get("enable_trend", True),
             enable_time_filter=filter_config.get("enable_time", True),
             volume_lookback=filter_config.get("volume_lookback", 20),
-            min_volume_ratio=filter_config.get("min_volume_ratio", 0.8)
+            min_volume_ratio=filter_config.get("min_volume_ratio", 0.8),
+            no_new_trades_after=no_new_after_time
         )
         logger.info(
             f"Composite Filter initialized | Volume: {filter_config.get('enable_volume', True)} | "
-            f"Trend: {filter_config.get('enable_trend', True)} | Time: {filter_config.get('enable_time', True)}"
+            f"Trend: {filter_config.get('enable_trend', True)} | Time: {filter_config.get('enable_time', True)} | "
+            f"No new trades after: {timing_str}"
         )
         
         # Initialize Dynamic Strike Selector (v3.0 - selects on N-Structure signal)
@@ -337,22 +374,27 @@ class TradingBot:
         # Get current state context
         ctx = self.fsm.context
         last_change = ctx.last_state_change
+        current_state = self.fsm.state
         
+        # Check if state is stale (from previous day)
         if last_change:
-            age = datetime.now() - last_change
-            current_state = self.fsm.state
+            now = datetime.now()
+            age = now - last_change
             
-            # If state is not IDLE and older than 1 day, it's stale
-            if age.days > 0 and current_state != TradingState.IDLE:
+            # Logic: If last state change was on a different day (date mismatch)
+            # AND we are not IDLE, it's a stale intraday state.
+            is_new_day = last_change.date() < now.date()
+            
+            if is_new_day and current_state != TradingState.IDLE:
                 logger.warning(
-                    f"⚠️ STALE STATE DETECTED: {current_state.name} is {age.days} days old! "
-                    f"Last change: {last_change.strftime('%Y-%m-%d %H:%M')} | Auto-resetting to IDLE"
+                    f"⚠️ STALE STATE DETECTED: {current_state.name} from {last_change.date()} "
+                    f"(Today: {now.date()}) | Auto-resetting to IDLE"
                 )
                 
                 # Force reset to IDLE
                 self.fsm.transition_to(
                     TradingState.IDLE,
-                    reason=f"Auto-reset: stale state ({age.days} days old)",
+                    reason=f"Auto-reset: stale state from previous day",
                     force=True
                 )
                 
@@ -360,9 +402,18 @@ class TradingBot:
                 self.fsm._context = StateContext()
                 self.fsm._persist_state()
                 
-                logger.success("✓ State auto-reset to IDLE")
-            elif age.days > 0:
-                logger.info(f"State {current_state.name} is {age.days} days old but IDLE - OK")
+                logger.success("✓ State auto-reset to IDLE (New Day Cleanup)")
+                
+            # Logic 2: If state is 'IN_POSITION' but it's been > 6 hours (stuck trade)
+            elif age.total_seconds() > 6 * 3600 and current_state == TradingState.IN_POSITION:
+                logger.warning(f"⚠️ STUCK POSITION DETECTED: State is IN_POSITION for > 6 hours. Auto-resetting.")
+                self.fsm.transition_to(TradingState.IDLE, reason="Auto-reset: stuck position > 6h", force=True)
+                self.fsm._context = StateContext()
+                self.fsm._persist_state()
+                logger.success("✓ State auto-reset to IDLE (Stuck Position Cleanup)")
+                 
+            elif is_new_day:
+                logger.info(f"State {current_state.name} is from previous day but safe (IDLE) - OK")
     
     def _reset_daily_counters(self) -> None:
         """
@@ -925,11 +976,12 @@ class TradingBot:
                     self._last_atm_strike = current_atm
             # ===== END DYNAMIC ATM RE-SELECTION =====
             
-            # Log candle received for visibility
-            logger.info(
-                f"🕯️ Candle {pair.timestamp.strftime('%H:%M')} | "
-                f"Index: {pair.index_candle.close:.2f} | "
-                f"Option [{self.current_option_type}]: {pair.option_candle.close:.2f}"
+            # Log candle in compact pro format
+            log_candle(
+                pair.timestamp.strftime('%H:%M'),
+                pair.index_candle.close,
+                pair.option_candle.close,
+                self.current_option_type
             )
             
             # Update EMAs
@@ -1067,6 +1119,33 @@ class TradingBot:
                         await self._switch_option_type("CE")
                     elif n_structure.direction == SignalDirection.BEARISH and self.current_option_type != "PE":
                         await self._switch_option_type("PE")
+                
+                # ==============================================================================
+                # 🔥 CRITICAL FIX: Explicitly handle READY_FOR_ENTRY to arm the FSM
+                # The detector confirms the signal, but FSM wasn't transitioning to ARMED
+                # because the n_structure.entry_trigger was not being set properly.
+                # ==============================================================================
+                if status == SetupStatus.READY_FOR_ENTRY:
+                    # 1. Check Filters first
+                    if filter_passed:
+                        # 2. Calculate Trigger Price
+                        entry_config = self.config.get("entry", {})
+                        buffer = entry_config.get("buffer_points", 1.5)
+                        slippage_buffer = entry_config.get("slippage_buffer_points", 0.75)
+                        entry_trigger = n_structure.breakout_high + buffer + slippage_buffer
+                        
+                        logger.info(f"✅ N-Structure READY_FOR_ENTRY! Arming FSM. Trigger: {entry_trigger:.2f}")
+                        
+                        # 3. Force Transition to ARMED via FSM method
+                        # Update context first
+                        self.fsm.context.entry_trigger_price = entry_trigger
+                        self.fsm.context.n_structure = n_structure
+                        
+                        # Call the proper FSM method to transition
+                        self.fsm.on_divergence_confirmed(entry_trigger=entry_trigger)
+                    else:
+                        logger.warning(f"⛔ N-Structure READY_FOR_ENTRY but filtered out: {filter_messages}")
+                # ==============================================================================
             
             previous_state = self.fsm.state
             
@@ -1130,6 +1209,35 @@ class TradingBot:
             
             # Update SL if in position
             if self.fsm.state == TradingState.IN_POSITION:
+                # Calculate and update unrealized P&L
+                entry_price = self.fsm.context.entry_price
+                current_price = option_candle.close
+                qty = self.fsm.context.quantity if self.fsm.context.quantity > 0 else self.config.get("risk", {}).get("fixed_quantity", 390)
+                unrealized_pnl = (current_price - entry_price) * qty
+                
+                # Update risk manager with unrealized P&L
+                if self.risk_manager:
+                    self.risk_manager.update_position_pnl(unrealized_pnl)
+                
+                # Update paper tracker if in paper mode
+                if self.paper_mode and hasattr(self, 'order_manager') and self.order_manager.paper_tracker:
+                    self.order_manager.paper_update_price(
+                        f"PAPER_{self._daily_trades_count:06d}",
+                        current_price
+                    )
+                
+                # Check partial profit targets (v1.3)
+                if self.partial_profit_enabled and self.partial_profit_manager:
+                    partial_result = self.partial_profit_manager.check_exit(current_price)
+                    if partial_result.exit_type == ExitType.PARTIAL_EXIT:
+                        logger.info(partial_result.message)
+                        # Place partial exit order
+                        await self._execute_partial_exit(
+                            exit_qty=partial_result.exit_quantity,
+                            exit_price=current_price,
+                            pnl_locked=partial_result.pnl_locked
+                        )
+                
                 sl_status, sl_reason = self.sl_manager.update_on_tick(
                     current_price=option_candle.close,
                     candle=option_candle
@@ -1209,16 +1317,14 @@ class TradingBot:
         pnl_points = exit_price - entry_price
         pnl = pnl_points * quantity
         
-        # 🔥 TRADE EXECUTION LOGGING: Log SL exit (CRITICAL FIX)
-        logger.warning(
-            f"\n❌ TRADE SL HIT | "
-            f"Exit Price: {exit_price:.2f} | "
-            f"Entry Price: {entry_price:.2f} | "
-            f"P&L: ₹{pnl:.0f} ({pnl_points:+.1f}pt) | "
-            f"Qty: {quantity} | "
-            f"Reason: {reason} | "
-            f"Direction: {self.current_option_type} | "
-            f"Time: {datetime.now().strftime('%H:%M:%S')}"
+        # Pro-style trade exit log
+        log_trade_exit(
+            symbol=self.current_option_symbol,
+            entry=entry_price,
+            exit_price=exit_price,
+            qty=quantity,
+            pnl=pnl,
+            reason=reason
         )
         
         # Record trade with risk manager
@@ -1259,6 +1365,51 @@ class TradingBot:
         
         # Reset SL manager
         self.sl_manager.reset()
+    
+    async def _execute_partial_exit(
+        self,
+        exit_qty: int,
+        exit_price: float,
+        pnl_locked: float
+    ) -> None:
+        """
+        Execute partial profit exit order (v1.3).
+        
+        Args:
+            exit_qty: Quantity to exit
+            exit_price: Exit price
+            pnl_locked: P&L being locked by this exit
+        """
+        logger.info(f"🎯 Partial Exit: {exit_qty} qty @ ₹{exit_price:.2f} | Locking ₹{pnl_locked:,.0f}")
+        
+        # Place partial exit order via order manager
+        result = self.order_manager.place_market_exit(
+            symbol=self.current_option_symbol,
+            token=self.current_option_token,
+            exchange="NFO",
+            quantity=exit_qty
+        )
+        
+        if result.success:
+            logger.success(f"✓ Partial exit placed: {result.order_id}")
+            
+            # Update FSM context with remaining quantity
+            remaining_qty = (self.fsm.context.quantity or 0) - exit_qty
+            if remaining_qty > 0:
+                self.fsm.context.quantity = remaining_qty
+                logger.info(f"Position reduced: {remaining_qty} qty remaining")
+            
+            # Send Telegram notification
+            if self.telegram:
+                await self.telegram.send_message(
+                    f"🎯 *Partial Profit Booked*\n"
+                    f"Symbol: `{self.current_option_symbol}`\n"
+                    f"Exit: {exit_qty} qty @ ₹{exit_price:.2f}\n"
+                    f"P&L Locked: ₹{pnl_locked:+,.0f}\n"
+                    f"Remaining: {remaining_qty} qty"
+                )
+        else:
+            logger.error(f"Partial exit failed: {result.message}")
     
     async def _execute_entry(
         self,
@@ -1351,22 +1502,21 @@ class TradingBot:
         response = self.order_manager.place_order(order_request)
         
         if response.success:
-            # Set up SL
+            # 🔥 BUG FIX: Use OPTION price for P&L, not INDEX trigger
+            option_entry_price = option_candle.close
+            
+            # Set up SL based on OPTION entry price
             exit_config = self.config.get("exit", {})
             sl_points = exit_config.get("initial_sl_points", 10.0)
-            sl_price = entry_trigger - sl_points
+            sl_price = option_entry_price - sl_points
             
-            # 🔥 TRADE EXECUTION LOGGING: Log successful entry (CRITICAL FIX)
-            logger.info(
-                f"✅ TRADE EXECUTED | "
-                f"Order ID: {response.order_id} | "
-                f"Entry Price: {entry_trigger:.2f} | "
-                f"SL Price: {sl_price:.2f} | "
-                f"SL Points: {sl_points:.2f} | "
-                f"Qty: {quantity} | "
-                f"Direction: {self.current_option_type} | "
-                f"Trades Today: {self._daily_trades_count + 1}/1 | "
-                f"Time: {datetime.now().strftime('%H:%M:%S')}"
+            # Pro-style trade entry log
+            log_trade_entry(
+                symbol=self.current_option_symbol,
+                price=option_entry_price,
+                qty=quantity,
+                sl=sl_price,
+                direction=self.current_option_type
             )
             
             self.sl_manager.initialize_sl(
@@ -1374,19 +1524,29 @@ class TradingBot:
                 token=self.current_option_token,
                 exchange="NFO",
                 quantity=quantity,
-                entry_price=entry_trigger
+                entry_price=option_entry_price
             )
             
-            # Update FSM
+            # Update FSM with OPTION entry price (not INDEX trigger)
             if is_reentry:
                 self.fsm.on_reentry_executed(
-                    entry_price=entry_trigger,
+                    entry_price=option_entry_price,
                     initial_sl=sl_price
                 )
             else:
                 self.fsm.on_entry_triggered(
-                    entry_price=entry_trigger,
+                    entry_price=option_entry_price,
                     initial_sl=sl_price
+                )
+            
+            # Store quantity in FSM context for P&L calculation
+            self.fsm.context.quantity = quantity
+            
+            # Register with partial profit manager
+            if self.partial_profit_enabled and self.partial_profit_manager:
+                self.partial_profit_manager.open_position(
+                    entry_price=option_entry_price,
+                    quantity=quantity
                 )
             
             # Set position for reconciliation
@@ -1412,21 +1572,14 @@ class TradingBot:
                 quantity=quantity,
                 order_type="STOPLOSS_LIMIT",
                 trigger_price=entry_trigger,
-                status="success",
-                is_reentry=is_reentry
-            )
-            
-            dir_emoji = "📈" if self.current_option_type == "CE" else "📉"
-            logger.success(
-                f"{dir_emoji} {trade_type} [{self.current_option_type}]: {self.current_option_symbol} @ {entry_trigger:.2f}, "
-                f"Qty={quantity}, SL={sl_price:.2f}"
+                status=f"success|reentry={is_reentry}"  # Include reentry info in status
             )
             
             # Send Telegram entry alert with direction
             if self.telegram:
                 await self.telegram.send_entry_alert(
                     symbol=self.current_option_symbol,
-                    entry_price=entry_trigger,
+                    entry_price=option_entry_price,
                     sl_price=sl_price,
                     quantity=quantity,
                     is_reentry=is_reentry,
@@ -1449,7 +1602,7 @@ class TradingBot:
     
     def _on_risk_event(self, event: RiskEvent, status) -> None:
         """Handle risk events (v1.2)."""
-        logger.warning(f"Risk Event [{event.value}]: SL Hits={status.sl_hits_today}/{self.risk_manager.limits.max_sl_per_day}")
+        log_risk_alert(f"{event.value} │ SL: {status.sl_hits_today}/{self.risk_manager.limits.max_sl_per_day} │ P&L: ₹{status.daily_pnl:,.0f}")
         self.slog.log_risk_event(
             event_type=event.value,
             daily_pnl=status.daily_pnl,
@@ -1503,6 +1656,15 @@ class TradingBot:
                 break
             await asyncio.sleep(1)
     
+    def _is_connection_error(self, error: Exception) -> bool:
+        """Check if error is a network/connection error."""
+        error_str = str(error).lower()
+        connection_keywords = [
+            'name resolution', 'connection', 'timeout', 'network',
+            'unreachable', 'refused', 'reset', 'dns', 'resolve'
+        ]
+        return any(kw in error_str for kw in connection_keywords)
+    
     async def run(self) -> None:
         """Main trading loop."""
         self._running = True
@@ -1520,47 +1682,60 @@ class TradingBot:
             trading_config.get("market_close_minute", 30)
         )
         
-        try:
-            # Set up market data immediately (strike selection + feed)
-            await self._setup_market_data()
-            
-            if self._shutdown_flag:
-                return
-            
-            # Send bot started notification
-            if self.telegram:
-                await self.telegram.send_bot_started(paper_mode=self.paper_mode)
-            
-            logger.info("Trading loop started")
-            
-            # Track if we logged market closed message
-            _logged_market_closed = False
-            
-            # Main loop - runs forever until manual shutdown
-            while not self._shutdown_flag:
-                now = datetime.now().time()
-                
-                # Check if market is open
-                is_market_open = market_open <= now < market_close
-                
-                if is_market_open:
-                    _logged_market_closed = False  # Reset for next close
-                    # Normal trading - processing happens in callbacks
-                else:
-                    # Market closed - just wait, don't shutdown
-                    if not _logged_market_closed:
-                        logger.info(f"⏸️ Market closed. Waiting for next session ({market_open})...")
-                        _logged_market_closed = True
-                
-                # Small sleep to prevent busy loop
-                await asyncio.sleep(0.1)
+        connection_retry_delay = 30  # Wait 30 seconds on connection error
         
-        except asyncio.CancelledError:
-            logger.info("Trading loop cancelled")
-        except Exception as e:
-            logger.error(f"Error in trading loop: {e}", exc_info=True)
-        finally:
-            await self.shutdown()
+        while not self._shutdown_flag:
+            try:
+                # Set up market data immediately (strike selection + feed)
+                await self._setup_market_data()
+                
+                if self._shutdown_flag:
+                    return
+                
+                # Send bot started notification
+                if self.telegram:
+                    await self.telegram.send_bot_started(paper_mode=self.paper_mode)
+                
+                logger.info("Trading loop started")
+                
+                # Track if we logged market closed message
+                _logged_market_closed = False
+                
+                # Main loop - runs forever until manual shutdown
+                while not self._shutdown_flag:
+                    now = datetime.now().time()
+                    
+                    # Check if market is open
+                    is_market_open = market_open <= now < market_close
+                    
+                    if is_market_open:
+                        _logged_market_closed = False  # Reset for next close
+                        # Normal trading - processing happens in callbacks
+                    else:
+                        # Market closed - just wait, don't shutdown
+                        if not _logged_market_closed:
+                            logger.info(f"⏸️ Market closed. Waiting for next session ({market_open})...")
+                            _logged_market_closed = True
+                    
+                    # Small sleep to prevent busy loop
+                    await asyncio.sleep(0.1)
+                    
+                break  # Normal exit from outer loop
+            
+            except asyncio.CancelledError:
+                logger.info("Trading loop cancelled")
+                break
+            except Exception as e:
+                if self._is_connection_error(e):
+                    logger.warning(f"⚠️ Connection error: {type(e).__name__}: {e}")
+                    logger.info(f"⏳ Waiting {connection_retry_delay}s for network... (will retry)")
+                    await asyncio.sleep(connection_retry_delay)
+                    continue  # Retry the whole setup
+                else:
+                    logger.error(f"Error in trading loop: {e}", exc_info=True)
+                    break  # Non-connection error, exit
+        
+        await self.shutdown()
     
     async def _reselect_strike(self) -> None:
         """Re-select option strike during trading."""
@@ -1683,12 +1858,12 @@ async def main():
         level=args.log_level
     )
     
-    logger.info("=" * 50)
-    logger.info("N-Structure Trading Bot Starting")
-    logger.info(f"Paper Mode: {args.paper}")
-    logger.info(f"Polling Mode: {args.polling}")
-    logger.info(f"Config: {args.config}")
-    logger.info("=" * 50)
+    # Pro startup banner
+    log_startup_banner(version="3.0")
+    mode = "📝 PAPER" if args.paper else "💰 LIVE"
+    feed = "🔄 POLLING" if args.polling else "⚡ WEBSOCKET"
+    log_system(f"Mode: {mode} | Feed: {feed}")
+    log_system(f"Config: {args.config}")
     
     # Create bot
     bot = TradingBot(config_path=args.config)
