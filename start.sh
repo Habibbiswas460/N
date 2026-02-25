@@ -1,314 +1,330 @@
 #!/bin/bash
-#═══════════════════════════════════════════════════════════════════════════════
-#  N-STRUCTURE TRADING BOT - Ultra Animated Launcher
-#  Sci-Fi Terminal Experience
-#═══════════════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                              ║
+# ║         ██╗  ██╗██╗   ██╗██████╗ ██████╗ ██╗██████╗                          ║
+# ║         ██║  ██║╚██╗ ██╔╝██╔══██╗██╔══██╗██║██╔══██╗                         ║
+# ║         ███████║ ╚████╔╝ ██████╔╝██████╔╝██║██║  ██║                         ║
+# ║         ██╔══██║  ╚██╔╝  ██╔══██╗██╔══██╗██║██║  ██║                         ║
+# ║         ██║  ██║   ██║   ██████╔╝██║  ██║██║██████╔╝                         ║
+# ║         ╚═╝  ╚═╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝                          ║
+# ║                                                                              ║
+# ║              ADAPTIVE HYBRID TRADING SYSTEM - Control Center v3.0           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+VERSION="3.0.0"
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+cd "\$SCRIPT_DIR"
+
+VENV_PATH="\$SCRIPT_DIR/venv"
+MAIN_SCRIPT="\$SCRIPT_DIR/src/main.py"
+LOG_DIR="\$SCRIPT_DIR/logs"
+DATA_DIR="\$SCRIPT_DIR/data"
+CONFIG_FILE="\$SCRIPT_DIR/config/settings.yaml"
 
 # Colors
+NC='\033[0m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
+PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-WHITE='\033[1;37m'
+WHITE='\033[0;37m'
 BOLD='\033[1m'
+BRED='\033[1;31m'
+BGREEN='\033[1;32m'
+BYELLOW='\033[1;33m'
+BBLUE='\033[1;34m'
+BPURPLE='\033[1;35m'
+BCYAN='\033[1;36m'
+BWHITE='\033[1;37m'
 DIM='\033[2m'
-BLINK='\033[5m'
-NC='\033[0m'
-
-# Extended colors (256)
-ORANGE='\033[38;5;208m'
-PINK='\033[38;5;213m'
-LIME='\033[38;5;118m'
-GOLD='\033[38;5;220m'
-PURPLE='\033[38;5;141m'
-TEAL='\033[38;5;45m'
-GRAY='\033[38;5;245m'
-
-# Background
-BG_BLACK='\033[40m'
 BG_RED='\033[41m'
 BG_GREEN='\033[42m'
-BG_BLUE='\033[44m'
 
-# Clear screen and hide cursor
-clear
-tput civis
-
-# Restore cursor on exit
-trap 'tput cnorm; echo -e "\n${NC}"; exit' INT TERM EXIT
-
-# Get terminal dimensions
-COLS=$(tput cols)
-ROWS=$(tput lines)
-CENTER=$((COLS / 2))
-
-#═══════════════════════════════════════════════════════════════════════════════
-# ANIMATION FUNCTIONS
-#═══════════════════════════════════════════════════════════════════════════════
-
-# Position cursor
-goto() {
-    echo -ne "\033[${1};${2}H"
+# Progress bar
+progress_bar() {
+    local duration=\$1
+    local width=40
+    for ((i=0; i<=100; i+=3)); do
+        local filled=\$((i * width / 100))
+        local empty=\$((width - filled))
+        printf "\r  \033[0;36m[\033[1;32m%s\033[2m%s\033[0;36m]\033[0m \033[1;37m%3d%%\033[0m" \
+            "\$(printf '%*s' \$filled | tr ' ' '█')" \
+            "\$(printf '%*s' \$empty | tr ' ' '░')" \$i
+        sleep \$(echo "scale=3; \$duration/33" | bc)
+    done
+    printf "\n"
 }
 
-# Matrix rain effect
-matrix_rain() {
-    local duration=$1
-    local chars="ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍ0123456789"
-    local end=$((SECONDS + duration))
+# Pulse message
+pulse_message() {
+    local msg="\$1"
+    for i in {1..2}; do
+        printf "\r  \033[1;32m▶ %s\033[0m  " "\$msg"
+        sleep 0.15
+        printf "\r  \033[2m▷ %s\033[0m  " "\$msg"
+        sleep 0.15
+    done
+    printf "\r  \033[1;32m✓ %s\033[0m  \n" "\$msg"
+}
+
+activate_venv() {
+    if [ -d "\$VENV_PATH" ]; then
+        source "\$VENV_PATH/bin/activate"
+        return 0
+    else
+        echo -e "\${RED}❌ Virtual environment not found!\${NC}"
+        return 1
+    fi
+}
+
+get_bot_pid() {
+    pgrep -f "python.*main.py" 2>/dev/null | head -1
+}
+
+is_bot_running() {
+    [ -n "\$(get_bot_pid)" ]
+}
+
+get_market_status() {
+    local hour=\$(date +%H)
+    local minute=\$(date +%M)
+    local time_num=\$((hour * 100 + minute))
+    local day=\$(date +%u)
     
-    while [ $SECONDS -lt $end ]; do
-        local col=$((RANDOM % COLS))
-        local char="${chars:RANDOM % ${#chars}:1}"
-        local color=$((RANDOM % 2))
-        
-        goto $((RANDOM % ROWS)) $col
-        if [ $color -eq 0 ]; then
-            echo -ne "${GREEN}${char}${NC}"
-        else
-            echo -ne "${LIME}${char}${NC}"
-        fi
-        sleep 0.01
+    if [ \$day -ge 6 ]; then echo "CLOSED"; return; fi
+    if [ \$time_num -lt 915 ]; then echo "PRE-MARKET"
+    elif [ \$time_num -ge 915 ] && [ \$time_num -lt 1530 ]; then echo "OPEN"
+    else echo "CLOSED"; fi
+}
+
+show_header() {
+    clear
+    echo -e "\${BCYAN}"
+    echo "  ╔══════════════════════════════════════════════════════════════════════╗"
+    echo "  ║                                                                      ║"
+    echo -e "  ║  \${BGREEN}█████╗ \${BCYAN}██████╗  \${BBLUE}█████╗ \${BPURPLE}██████╗ \${BRED}████████╗\${BYELLOW}██╗\${BGREEN}██╗   ██╗\${BCYAN}███████╗\${NC}\${BCYAN}  ║"
+    echo -e "  ║ \${BGREEN}██╔══██╗\${BCYAN}██╔══██╗\${BBLUE}██╔══██╗\${BPURPLE}██╔══██╗\${BRED}╚══██╔══╝\${BYELLOW}██║\${BGREEN}██║   ██║\${BCYAN}██╔════╝\${NC}\${BCYAN}  ║"
+    echo -e "  ║ \${BGREEN}███████║\${BCYAN}██║  ██║\${BBLUE}███████║\${BPURPLE}██████╔╝\${BRED}   ██║   \${BYELLOW}██║\${BGREEN}██║   ██║\${BCYAN}█████╗\${NC}\${BCYAN}    ║"
+    echo -e "  ║ \${BGREEN}██╔══██║\${BCYAN}██║  ██║\${BBLUE}██╔══██║\${BPURPLE}██╔═══╝ \${BRED}   ██║   \${BYELLOW}██║\${BGREEN}╚██╗ ██╔╝\${BCYAN}██╔══╝\${NC}\${BCYAN}    ║"
+    echo -e "  ║ \${BGREEN}██║  ██║\${BCYAN}██████╔╝\${BBLUE}██║  ██║\${BPURPLE}██║     \${BRED}   ██║   \${BYELLOW}██║\${BGREEN} ╚████╔╝ \${BCYAN}███████╗\${NC}\${BCYAN}  ║"
+    echo -e "  ║ \${BGREEN}╚═╝  ╚═╝\${BCYAN}╚═════╝ \${BBLUE}╚═╝  ╚═╝\${BPURPLE}╚═╝     \${BRED}   ╚═╝   \${BYELLOW}╚═╝\${BGREEN}  ╚═══╝  \${BCYAN}╚══════╝\${NC}\${BCYAN}  ║"
+    echo "  ║                                                                      ║"
+    echo -e "  ║      \${BWHITE}HYBRID TRADING SYSTEM\${NC}\${BCYAN} │ \${BGREEN}Control Center v\${VERSION}\${NC}\${BCYAN}             ║"
+    echo "  ╚══════════════════════════════════════════════════════════════════════╝"
+    echo -e "\${NC}"
+}
+
+show_status_bar() {
+    local market=\$(get_market_status)
+    local bot_status="STOPPED" bot_color="\${RED}" market_color="\${RED}"
+    
+    is_bot_running && { bot_status="RUNNING"; bot_color="\${BGREEN}"; }
+    case "\$market" in
+        "OPEN") market_color="\${BGREEN}" ;;
+        "PRE-MARKET") market_color="\${BYELLOW}" ;;
+    esac
+    
+    echo -e "  \${DIM}┌─────────────────────────────────────────────────────────────────────────┐\${NC}"
+    echo -e "  \${DIM}│\${NC}  📅 \${BWHITE}\$(date '+%Y-%m-%d')\${NC}  │  🕐 \${BCYAN}\$(date '+%H:%M:%S')\${NC}  │  📈 Market: \${market_color}\${market}\${NC}  │  🤖 Bot: \${bot_color}\${bot_status}\${NC}  \${DIM}│\${NC}"
+    echo -e "  \${DIM}└─────────────────────────────────────────────────────────────────────────┘\${NC}"
+    echo ""
+}
+
+show_live_stats() {
+    echo -e "  \${BWHITE}╭───────────────────── 📊 LIVE STATUS ─────────────────────╮\${NC}"
+    
+    local capital="50,000" pnl="0" trades="0"
+    if [ -f "\$DATA_DIR/paper_state.json" ]; then
+        capital=\$(python3 -c "import json; d=json.load(open('\$DATA_DIR/paper_state.json')); print(f\"{d.get('capital', 50000):,.0f}\")" 2>/dev/null || echo "50,000")
+        pnl=\$(python3 -c "import json; d=json.load(open('\$DATA_DIR/paper_state.json')); print(f\"{d.get('daily_pnl', 0):+,.0f}\")" 2>/dev/null || echo "0")
+        trades=\$(python3 -c "import json; d=json.load(open('\$DATA_DIR/paper_state.json')); print(d.get('trades_today', 0))" 2>/dev/null || echo "0")
+    fi
+    
+    local pnl_color="\${GREEN}"
+    [[ "\$pnl" == "-"* ]] && pnl_color="\${RED}"
+    
+    echo -e "  \${DIM}│\${NC}   💰 Capital: \${BGREEN}₹\${capital}\${NC}  │  📈 P&L: \${pnl_color}₹\${pnl}\${NC}  │  🔢 Trades: \${BCYAN}\${trades}\${NC}   \${DIM}│\${NC}"
+    echo -e "  \${BWHITE}╰──────────────────────────────────────────────────────────╯\${NC}"
+    echo ""
+}
+
+show_menu() {
+    echo -e "  \${BGREEN}┌─────────────────────── 🚀 TRADING ────────────────────────┐\${NC}"
+    if is_bot_running; then
+        echo -e "  \${BGREEN}│\${NC}    \${DIM}[1] Start Live Trading\${NC}      \${BRED}[3] 🛑 Stop Bot\${NC}        \${BGREEN}│\${NC}"
+        echo -e "  \${BGREEN}│\${NC}    \${DIM}[2] Start Paper Trading\${NC}                               \${BGREEN}│\${NC}"
+    else
+        echo -e "  \${BGREEN}│\${NC}    \${BWHITE}[1]\${NC} 🔴 \${BRED}Start Live\${NC}          \${DIM}[3] Stop Bot\${NC}            \${BGREEN}│\${NC}"
+        echo -e "  \${BGREEN}│\${NC}    \${BWHITE}[2]\${NC} 📝 \${BYELLOW}Start Paper\${NC}                                    \${BGREEN}│\${NC}"
+    fi
+    echo -e "  \${BGREEN}└──────────────────────────────────────────────────────────┘\${NC}"
+    echo ""
+    
+    echo -e "  \${BCYAN}┌─────────────────────── 🔬 ANALYSIS ───────────────────────┐\${NC}"
+    echo -e "  \${BCYAN}│\${NC}    \${BWHITE}[4]\${NC} 📊 Dashboard         \${BWHITE}[5]\${NC} 🔬 Backtest           \${BCYAN}│\${NC}"
+    echo -e "  \${BCYAN}│\${NC}    \${BWHITE}[6]\${NC} ⚙️  Optimizer          \${BWHITE}[7]\${NC} 📈 Trade History      \${BCYAN}│\${NC}"
+    echo -e "  \${BCYAN}└──────────────────────────────────────────────────────────┘\${NC}"
+    echo ""
+    
+    echo -e "  \${BBLUE}┌─────────────────────── ⚙️  SYSTEM ────────────────────────┐\${NC}"
+    echo -e "  \${BBLUE}│\${NC}    \${BWHITE}[8]\${NC} 📜 View Logs          \${BWHITE}[9]\${NC} 🧪 Run Tests          \${BBLUE}│\${NC}"
+    echo -e "  \${BBLUE}│\${NC}    \${BWHITE}[10]\${NC} ⚙️ Settings           \${BWHITE}[11]\${NC} 🗑️  Clear Cache       \${BBLUE}│\${NC}"
+    echo -e "  \${BBLUE}└──────────────────────────────────────────────────────────┘\${NC}"
+    echo ""
+    
+    echo -e "  \${BPURPLE}┌─────────────────────── ⚡ QUICK ──────────────────────────┐\${NC}"
+    echo -e "  \${BPURPLE}│\${NC}    \${BWHITE}[r]\${NC} 🔄 Refresh    \${BWHITE}[s]\${NC} 📊 Stats    \${BWHITE}[0/q]\${NC} 🚪 Exit     \${BPURPLE}│\${NC}"
+    echo -e "  \${BPURPLE}└──────────────────────────────────────────────────────────┘\${NC}"
+    echo ""
+}
+
+start_live() {
+    show_header
+    echo -e "  \${BG_RED}\${BWHITE}  ⚠️  WARNING: LIVE TRADING WITH REAL MONEY  \${NC}"
+    echo ""
+    read -p "  Type 'CONFIRM' to proceed: " confirm
+    [ "\$confirm" != "CONFIRM" ] && { echo -e "  \${YELLOW}❌ Cancelled\${NC}"; sleep 1; return; }
+    is_bot_running && { echo -e "  \${YELLOW}⚠️  Bot already running\${NC}"; sleep 2; return; }
+    
+    activate_venv || return
+    pulse_message "Initializing Live Trading"
+    
+    mkdir -p "\$LOG_DIR/\$(date +%Y-%m-%d)"
+    nohup python3 "\$MAIN_SCRIPT" --polling > "\$LOG_DIR/\$(date +%Y-%m-%d)/live.log" 2>&1 &
+    local PID=\$!
+    progress_bar 2
+    
+    ps -p \$PID > /dev/null 2>&1 && echo -e "  \${BGREEN}✓ Started! PID: \$PID\${NC}" || echo -e "  \${RED}❌ Failed\${NC}"
+    read -p "  Press Enter..."
+}
+
+start_paper() {
+    show_header
+    echo -e "  \${BYELLOW}╔═══════════════════════════════════════╗\${NC}"
+    echo -e "  \${BYELLOW}║\${NC}    \${BWHITE}📝 PAPER TRADING MODE\${NC}            \${BYELLOW}║\${NC}"
+    echo -e "  \${BYELLOW}╚═══════════════════════════════════════╝\${NC}"
+    echo ""
+    
+    is_bot_running && { echo -e "  \${YELLOW}⚠️  Bot already running\${NC}"; sleep 2; return; }
+    
+    activate_venv || return
+    pulse_message "Initializing Paper Trading"
+    
+    mkdir -p "\$LOG_DIR/\$(date +%Y-%m-%d)"
+    nohup python3 "\$MAIN_SCRIPT" --paper --polling > "\$LOG_DIR/\$(date +%Y-%m-%d)/paper.log" 2>&1 &
+    local PID=\$!
+    progress_bar 2
+    
+    ps -p \$PID > /dev/null 2>&1 && echo -e "  \${BGREEN}✓ Started! PID: \$PID\${NC}" || echo -e "  \${RED}❌ Failed\${NC}"
+    read -p "  Press Enter..."
+}
+
+stop_bot() {
+    show_header
+    is_bot_running || { echo -e "  \${YELLOW}ℹ️  Bot not running\${NC}"; sleep 1; return; }
+    
+    local pid=\$(get_bot_pid)
+    echo -e "  \${BRED}Stopping bot (PID: \$pid)...\${NC}"
+    kill \$pid 2>/dev/null; sleep 2
+    is_bot_running && pkill -9 -f "python.*main.py" 2>/dev/null
+    echo -e "  \${BGREEN}✓ Stopped\${NC}"
+    sleep 1
+}
+
+view_dashboard() {
+    show_header
+    echo -e "  \${BCYAN}📊 DASHBOARD\${NC}"
+    activate_venv && python3 scripts/dashboard.py 2>/dev/null || echo "  Dashboard not available"
+    read -p "  Press Enter..."
+}
+
+run_backtest() {
+    show_header
+    echo -e "  \${BCYAN}🔬 BACKTEST\${NC}"
+    read -p "  Days [30]: " days; days=\${days:-30}
+    activate_venv || return
+    pulse_message "Running \$days day backtest"
+    PYTHONPATH="\$SCRIPT_DIR" python3 run_backtest.py --days "\$days" 2>/dev/null || echo "  Backtest not available"
+    read -p "  Press Enter..."
+}
+
+run_optimizer() {
+    show_header
+    echo -e "  \${BPURPLE}⚙️  OPTIMIZER\${NC}"
+    read -p "  Iterations [50]: " n; n=\${n:-50}
+    activate_venv && python3 scripts/optimizer.py --max-iter "\$n" 2>/dev/null || echo "  Not available"
+    read -p "  Press Enter..."
+}
+
+view_history() {
+    show_header
+    echo -e "  \${BPURPLE}📈 TRADE HISTORY\${NC}"
+    ls -la "\$LOG_DIR" 2>/dev/null | tail -10 || echo "  No history"
+    read -p "  Press Enter..."
+}
+
+view_logs() {
+    show_header
+    echo -e "  \${BBLUE}📜 LIVE LOGS\${NC} (Ctrl+C to exit)"
+    local today=\$(date +%Y-%m-%d)
+    [ -f "\$LOG_DIR/\$today/paper.log" ] && tail -f "\$LOG_DIR/\$today/paper.log" && return
+    [ -f "\$LOG_DIR/\$today/live.log" ] && tail -f "\$LOG_DIR/\$today/live.log" && return
+    [ -f "\$LOG_DIR/trading.log" ] && tail -f "\$LOG_DIR/trading.log" && return
+    echo "  No logs"; read -p "  Press Enter..."
+}
+
+run_tests() {
+    show_header
+    echo -e "  \${BBLUE}🧪 TESTS\${NC}"
+    activate_venv && python3 -m pytest tests/ -v --tb=short 2>/dev/null || echo "  No tests"
+    read -p "  Press Enter..."
+}
+
+edit_settings() {
+    command -v nano &>/dev/null && nano "\$CONFIG_FILE" && return
+    command -v vim &>/dev/null && vim "\$CONFIG_FILE" && return
+    show_header; cat "\$CONFIG_FILE"; read -p "  Press Enter..."
+}
+
+clear_cache() {
+    show_header
+    find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+    find "\$LOG_DIR" -type f -mtime +7 -delete 2>/dev/null
+    echo -e "  \${BGREEN}✓ Cache cleared!\${NC}"
+    sleep 1
+}
+
+quick_stats() {
+    show_header
+    show_status_bar
+    show_live_stats
+    local today=\$(date +%Y-%m-%d)
+    echo -e "  \${BWHITE}Recent Activity:\${NC}"
+    [ -f "\$LOG_DIR/\$today/paper.log" ] && tail -5 "\$LOG_DIR/\$today/paper.log" || echo "  No recent activity"
+    read -p "  Press Enter..."
+}
+
+main() {
+    activate_venv 2>/dev/null
+    while true; do
+        show_header
+        show_status_bar
+        show_live_stats
+        show_menu
+        echo -ne "  \${BWHITE}▶ Select: \${NC}"
+        read -r choice
+        case \$choice in
+            1) start_live ;; 2) start_paper ;; 3) stop_bot ;;
+            4) view_dashboard ;; 5) run_backtest ;; 6) run_optimizer ;; 7) view_history ;;
+            8) view_logs ;; 9) run_tests ;; 10) edit_settings ;; 11) clear_cache ;;
+            r|R) continue ;; s|S) quick_stats ;;
+            0|q|Q) echo -e "\n  \${BCYAN}Goodbye! 👋\${NC}\n"; exit 0 ;;
+            *) echo -e "  \${RED}Invalid\${NC}"; sleep 0.5 ;;
+        esac
     done
 }
 
-# Cyber loading bar
-cyber_bar() {
-    local text="$1"
-    local width=50
-    local bar_char="█"
-    local empty_char="░"
-    
-    echo -ne "\n"
-    for i in $(seq 1 100); do
-        local filled=$((i * width / 100))
-        local empty=$((width - filled))
-        local bar=""
-        
-        # Create gradient bar
-        for j in $(seq 1 $filled); do
-            if [ $j -lt $((width / 3)) ]; then
-                bar+="${CYAN}${bar_char}"
-            elif [ $j -lt $((width * 2 / 3)) ]; then
-                bar+="${BLUE}${bar_char}"
-            else
-                bar+="${PURPLE}${bar_char}"
-            fi
-        done
-        
-        for j in $(seq 1 $empty); do
-            bar+="${GRAY}${empty_char}"
-        done
-        
-        echo -ne "\r  ${WHITE}${text} ${NC}[${bar}${NC}] ${GOLD}${i}%${NC}  "
-        sleep 0.015
-    done
-    echo -ne " ${GREEN}✓${NC}\n"
-}
-
-# Spinning loader
-spin() {
-    local text="$1"
-    local duration=$2
-    local spinners=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    local end=$((SECONDS + duration))
-    local i=0
-    
-    while [ $SECONDS -lt $end ]; do
-        echo -ne "\r  ${CYAN}${spinners[i]}${NC} ${text}"
-        i=$(((i + 1) % ${#spinners[@]}))
-        sleep 0.08
-    done
-    echo -ne "\r  ${GREEN}✓${NC} ${text}\n"
-}
-
-# Pulse text animation
-pulse_text() {
-    local text="$1"
-    local colors=("$RED" "$ORANGE" "$YELLOW" "$GREEN" "$CYAN" "$BLUE" "$PURPLE")
-    
-    for _ in {1..3}; do
-        for color in "${colors[@]}"; do
-            echo -ne "\r  ${color}${BOLD}${text}${NC}   "
-            sleep 0.05
-        done
-    done
-    echo -ne "\r  ${GREEN}${BOLD}${text}${NC}   \n"
-}
-
-# Typewriter effect
-typewriter() {
-    local text="$1"
-    local delay=${2:-0.03}
-    
-    for ((i=0; i<${#text}; i++)); do
-        echo -n "${text:$i:1}"
-        sleep $delay
-    done
-}
-
-# Glitch text
-glitch() {
-    local text="$1"
-    local glitch_chars="!@#$%^&*()_+-=[]{}|;':\",./<>?"
-    
-    for _ in {1..5}; do
-        local glitched=""
-        for ((i=0; i<${#text}; i++)); do
-            if [ $((RANDOM % 4)) -eq 0 ]; then
-                glitched+="${glitch_chars:RANDOM % ${#glitch_chars}:1}"
-            else
-                glitched+="${text:$i:1}"
-            fi
-        done
-        echo -ne "\r  ${RED}${glitched}${NC}"
-        sleep 0.05
-    done
-    echo -ne "\r  ${WHITE}${text}${NC}\n"
-}
-
-#═══════════════════════════════════════════════════════════════════════════════
-# MAIN ANIMATION SEQUENCE
-#═══════════════════════════════════════════════════════════════════════════════
-
-# Matrix intro
-matrix_rain 1
-clear
-
-# ASCII Art Banner with animation
-echo ""
-sleep 0.1
-
-# Draw banner character by character
-banner_lines=(
-"${CYAN}    ███╗   ██╗${BLUE}    ███████╗████████╗██████╗ ██╗   ██╗ ██████╗████████╗${NC}"
-"${CYAN}    ████╗  ██║${BLUE}    ██╔════╝╚══██╔══╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝${NC}"
-"${CYAN}    ██╔██╗ ██║${BLUE}    ███████╗   ██║   ██████╔╝██║   ██║██║        ██║   ${NC}"
-"${CYAN}    ██║╚██╗██║${BLUE}    ╚════██║   ██║   ██╔══██╗██║   ██║██║        ██║   ${NC}"
-"${CYAN}    ██║ ╚████║${BLUE}    ███████║   ██║   ██║  ██║╚██████╔╝╚██████╗   ██║   ${NC}"
-"${CYAN}    ╚═╝  ╚═══╝${BLUE}    ╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝  ╚═════╝   ╚═╝   ${NC}"
-)
-
-for line in "${banner_lines[@]}"; do
-    echo -e "$line"
-    sleep 0.08
-done
-
-echo ""
-echo -e "${GRAY}    ─────────────────────────────────────────────────────────────────${NC}"
-echo ""
-
-# Animated subtitle
-echo -ne "    "
-typewriter "⚡ ALGORITHMIC OPTIONS TRADING SYSTEM v3.0 ⚡" 0.02
-echo ""
-echo ""
-
-sleep 0.3
-
-# System check animations
-echo -e "  ${GOLD}┌──────────────────────────────────────────────────────────────────┐${NC}"
-echo -e "  ${GOLD}│${NC}                    ${WHITE}${BOLD}SYSTEM INITIALIZATION${NC}                        ${GOLD}│${NC}"
-echo -e "  ${GOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
-echo ""
-
-spin "Initializing quantum trading core..." 1
-spin "Loading neural pattern recognition..." 1
-spin "Calibrating market sensors..." 1
-spin "Establishing secure connection..." 1
-
-echo ""
-
-# Mode selection with fancy display
-echo -e "  ${PURPLE}╔══════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "  ${PURPLE}║${NC}  ${BLINK}▶${NC}  ${WHITE}${BOLD}SELECT TRADING MODE${NC}                                          ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}╠══════════════════════════════════════════════════════════════════╣${NC}"
-echo -e "  ${PURPLE}║${NC}                                                                  ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}    ${CYAN}[1]${NC} ${WHITE}📝 PAPER TRADING${NC}  ${DIM}- Safe simulation mode${NC}                ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}                                                                  ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}    ${RED}[2]${NC} ${WHITE}🔴 LIVE TRADING${NC}   ${DIM}- Real money (use caution!)${NC}           ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}                                                                  ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}    ${YELLOW}[3]${NC} ${WHITE}🧪 BACKTEST${NC}       ${DIM}- Test on historical data${NC}             ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}                                                                  ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}    ${GRAY}[q]${NC} ${WHITE}❌ EXIT${NC}                                                    ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}║${NC}                                                                  ${PURPLE}║${NC}"
-echo -e "  ${PURPLE}╚══════════════════════════════════════════════════════════════════╝${NC}"
-echo ""
-
-# Blinking prompt
-echo -ne "  ${CYAN}${BOLD}⟫${NC} "
-read -n1 choice
-echo ""
-echo ""
-
-case $choice in
-    1)
-        glitch "PAPER TRADING MODE SELECTED"
-        echo ""
-        cyber_bar "Loading Paper Trading Environment"
-        
-        echo ""
-        echo -e "  ${GREEN}┌────────────────────────────────────────────────────────────────┐${NC}"
-        echo -e "  ${GREEN}│${NC}  ${LIME}▶${NC} ${WHITE}Starting Paper Trading Bot...${NC}                               ${GREEN}│${NC}"
-        echo -e "  ${GREEN}│${NC}  ${DIM}  Mode: Simulation | Capital: ₹50,000 | Risk: ₹1,950/trade${NC}  ${GREEN}│${NC}"
-        echo -e "  ${GREEN}└────────────────────────────────────────────────────────────────┘${NC}"
-        echo ""
-        
-        sleep 1
-        tput cnorm
-        cd "$(dirname "$0")"
-        source venv/bin/activate 2>/dev/null || true
-        exec python3 src/main.py --paper --polling
-        ;;
-    2)
-        glitch "⚠️  LIVE TRADING MODE - REAL MONEY ⚠️"
-        echo ""
-        echo -e "  ${RED}${BOLD}╔════════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "  ${RED}${BOLD}║${NC}  ${BLINK}⚠️${NC}  ${WHITE}WARNING: THIS WILL TRADE WITH REAL MONEY!${NC}               ${RED}${BOLD}║${NC}"
-        echo -e "  ${RED}${BOLD}║${NC}      ${DIM}Ensure you understand the risks involved.${NC}              ${RED}${BOLD}║${NC}"
-        echo -e "  ${RED}${BOLD}╚════════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo -ne "  ${YELLOW}Continue? (y/N): ${NC}"
-        read -n1 confirm
-        echo ""
-        
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            cyber_bar "Activating Live Trading Systems"
-            echo ""
-            tput cnorm
-            cd "$(dirname "$0")"
-            source venv/bin/activate 2>/dev/null || true
-            exec python3 src/main.py --polling
-        else
-            echo -e "  ${GREEN}✓${NC} Cancelled. Stay safe!"
-        fi
-        ;;
-    3)
-        glitch "BACKTEST MODE SELECTED"
-        echo ""
-        echo -ne "  ${CYAN}Enter date range (YYYY-MM-DD to YYYY-MM-DD): ${NC}"
-        read daterange
-        cyber_bar "Loading Historical Data"
-        echo ""
-        tput cnorm
-        cd "$(dirname "$0")"
-        source venv/bin/activate 2>/dev/null || true
-        exec python3 scripts/backtest/run_backtest.py
-        ;;
-    q|Q)
-        echo ""
-        echo -e "  ${CYAN}Shutting down...${NC}"
-        for i in {5..1}; do
-            echo -ne "\r  ${GRAY}Goodbye in ${WHITE}$i${GRAY}...${NC}  "
-            sleep 0.3
-        done
-        echo -e "\n\n  ${GREEN}💫 May your trades be profitable! 💫${NC}\n"
-        exit 0
-        ;;
-    *)
-        echo -e "  ${RED}Invalid option. Exiting...${NC}"
-        exit 1
-        ;;
-esac
+trap 'echo ""; echo -e "  \${YELLOW}Use [0] or [q] to exit\${NC}"; sleep 1' INT
+main

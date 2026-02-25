@@ -1,1 +1,1 @@
-# N-Structure Trading Bot
+# Adaptive Hybrid Trading Bot v1.0

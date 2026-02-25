@@ -14,13 +14,23 @@ WARNING: This manages REAL money - all checks are STRICT!
 """
 
 from datetime import datetime, date, time, timedelta
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
 
 from loguru import logger
 
-from core.state_store import StateStore, get_state_store
+
+# Stub StateStore for compatibility (state_store.py was removed)
+class StateStore:
+    """Minimal state store stub"""
+    def get_daily_stats(self) -> Dict[str, Any]:
+        return {"sl_count": 0, "trade_count": 0, "pnl": 0.0}
+    def update_daily_stats(self, **kwargs):
+        pass
+
+def get_state_store() -> StateStore:
+    return StateStore()
 
 
 class RiskEvent(Enum):

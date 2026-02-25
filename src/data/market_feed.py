@@ -7,7 +7,9 @@ Handles dual-stream subscription, heartbeat, and reconnection.
 
 import asyncio
 import json
+import queue
 import time
+import threading
 from datetime import datetime
 from typing import Optional, Callable, Dict, List, Any, Set
 from dataclasses import dataclass, field
@@ -138,6 +140,9 @@ class MarketFeed:
         self._tick_buffers: Dict[str, deque] = {}
         self._buffer_size = 100
         
+        # Thread-safe queue for async polling
+        self._tick_queue: queue.Queue = queue.Queue()
+        
     def _create_websocket(self) -> None:
         """Create WebSocket instance with callbacks."""
         if SmartWebSocketV2 is None:
@@ -185,7 +190,6 @@ class MarketFeed:
     def _on_data(self, wsapp, message: dict) -> None:
         """Handle incoming tick data."""
         try:
-            logger.debug(f"📥 Raw WS data: {str(message)[:200]}")
             tick = TickData.from_websocket_data(message)
             
             # Store latest tick
@@ -195,6 +199,12 @@ class MarketFeed:
             if tick.token not in self._tick_buffers:
                 self._tick_buffers[tick.token] = deque(maxlen=self._buffer_size)
             self._tick_buffers[tick.token].append(tick)
+            
+            # Add to async queue for polling
+            try:
+                self._tick_queue.put_nowait(tick)
+            except queue.Full:
+                pass  # Drop oldest if queue is full
             
             # Notify tick callbacks
             for callback in self._tick_callbacks:
@@ -293,7 +303,9 @@ class MarketFeed:
         try:
             self._create_websocket()
             if self._ws:
-                self._ws.connect()
+                # Run WebSocket in a daemon thread (it blocks forever)
+                ws_thread = threading.Thread(target=self._ws.connect, daemon=True)
+                ws_thread.start()
                 
                 # Wait for connection to be established
                 start_time = time.time()
@@ -335,6 +347,8 @@ class MarketFeed:
         
         if self._is_connected:
             self._do_subscribe([token], ExchangeType.NSE_CM, mode)
+        else:
+            logger.warning(f"Not connected, subscription queued for later")
             
     def subscribe_option(
         self,
@@ -442,6 +456,26 @@ class MarketFeed:
             TickData if available, None otherwise
         """
         return self._latest_ticks.get(token)
+    
+    async def get_tick(self, timeout: float = 1.0) -> Optional[TickData]:
+        """
+        Get next tick from queue asynchronously.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            TickData if available within timeout, None otherwise
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            tick = await loop.run_in_executor(
+                None,
+                lambda: self._tick_queue.get(timeout=timeout)
+            )
+            return tick
+        except queue.Empty:
+            return None
     
     def get_tick_buffer(self, token: str) -> List[TickData]:
         """
