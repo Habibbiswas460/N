@@ -89,6 +89,16 @@ class AdaptiveTradingBot:
         self.ce_symbol: Optional[str] = None
         self.pe_symbol: Optional[str] = None
         
+        # Market hours tracking
+        self._logged_market_closed = False
+        
+    def is_market_open(self) -> bool:
+        """Check if market is currently open for trading"""
+        now = datetime.now().time()
+        market_open = time(9, 15)
+        market_close = time(15, 30)
+        return market_open <= now <= market_close
+    
     def load_config(self) -> Dict[str, Any]:
         """Load configuration from YAML file"""
         with open(self.config_path, 'r') as f:
@@ -477,14 +487,22 @@ class AdaptiveTradingBot:
                         logger.info(f"💓 Heartbeat: {tick_count} ticks processed | LTP: {tick.ltp:.2f}")
                         last_heartbeat = time_module.time()
                         
-                    # Process tick
+                    # Process tick only during market hours
                     if tick.token == self.index_token:
-                        candle = self.index_candle_builder.process_tick(tick)
-                        
-                        if candle:
-                            await self.process_candle(candle)
+                        # Build candles only during market hours
+                        if self.is_market_open():
+                            self._logged_market_closed = False
+                            candle = self.index_candle_builder.process_tick(tick)
                             
-                        # Check exit conditions
+                            if candle:
+                                await self.process_candle(candle)
+                        else:
+                            # Log once when market closes
+                            if not self._logged_market_closed:
+                                logger.info("🔒 Market CLOSED - Candle building paused (9:15-15:30)")
+                                self._logged_market_closed = True
+                            
+                        # Check exit conditions always (even after market close)
                         if self.current_trade:
                             await self.check_exit_conditions(tick.ltp)
                             
