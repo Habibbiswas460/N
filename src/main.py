@@ -80,7 +80,12 @@ class AdaptiveTradingBot:
         # Current trade
         self.current_trade: Optional[TradeSignal] = None
         self.entry_order_id: Optional[str] = None
-        self.entry_price: float = 0.0
+        self.entry_price: float = 0.0  # Index price at entry (for SL/Target)
+        
+        # Option trade tracking (for actual P&L)
+        self.option_entry_price: float = 0.0  # Actual option premium at entry
+        self.active_option_token: Optional[str] = None  # Token of option being traded
+        self.active_option_symbol: Optional[str] = None  # Symbol of option being traded
         
         # Tokens
         self.index_token: str = ""
@@ -277,6 +282,19 @@ class AdaptiveTradingBot:
         except Exception as e:
             logger.error(f"Error getting index LTP: {e}")
         return None
+    
+    async def _get_option_ltp(self, token: str) -> Optional[float]:
+        """Get current option LTP for P&L calculation"""
+        try:
+            ltp = self.auth.get_ltp(
+                exchange="NFO",
+                symbol="",  # Token is sufficient
+                token=token
+            )
+            return ltp
+        except Exception as e:
+            logger.error(f"Error getting option LTP: {e}")
+        return None
         
     async def process_candle(self, candle: Candle):
         """Process completed candle and generate signals"""
@@ -353,8 +371,17 @@ class AdaptiveTradingBot:
             if result and result.order_id:
                 self.current_trade = signal
                 self.entry_order_id = result.order_id
-                self.entry_price = signal.entry_price
+                self.entry_price = signal.entry_price  # Index price for SL/Target
                 self._exit_in_progress = False  # Reset exit lock for new trade
+                
+                # Track option for P&L calculation
+                self.active_option_token = option_token
+                self.active_option_symbol = option_symbol
+                
+                # Get actual option LTP for P&L tracking
+                option_ltp = await self._get_option_ltp(option_token)
+                self.option_entry_price = option_ltp if option_ltp else 100.0  # Fallback
+                logger.info(f"💰 Option Entry LTP: ₹{self.option_entry_price:.2f}")
                 
                 # Set stop loss
                 self.sl_manager.initialize_sl(
@@ -368,12 +395,12 @@ class AdaptiveTradingBot:
                 # Notify strategy
                 self.strategy.on_trade_entry()
                 
-                # Log and notify
+                # Log and notify (using option price)
                 log_trade_entry(
                     symbol=option_symbol,
-                    price=signal.entry_price,
+                    price=self.option_entry_price,  # Use option price, not index
                     qty=self.config['risk']['fixed_quantity'],
-                    sl=signal.stop_loss,
+                    sl=signal.stop_loss,  # Index SL for reference
                     direction=signal.signal.value
                 )
                 
@@ -382,10 +409,10 @@ class AdaptiveTradingBot:
                         f"📈 <b>TRADE ENTRY</b>\n"
                         f"Signal: {signal.signal.value}\n"
                         f"Option: {option_symbol}\n"
-                        f"Entry: ₹{signal.entry_price:.2f}\n"
-                        f"SL: ₹{signal.stop_loss:.2f}\n"
-                        f"Target: ₹{signal.target_1:.2f}\n"
-                        f"R:R: 1:{signal.reward_ratio:.1f}\n"
+                        f"Option Price: ₹{self.option_entry_price:.2f}\n"
+                        f"Index: ₹{signal.entry_price:.2f}\n"
+                        f"Index SL: ₹{signal.stop_loss:.2f}\n"
+                        f"Index Target: ₹{signal.target_1:.2f}\n"
                         f"Regime: {signal.regime}"
                     )
                     
@@ -413,29 +440,55 @@ class AdaptiveTradingBot:
             elif current_price <= self.current_trade.target_1:
                 await self._exit_trade("Target 1 Hit", current_price)
                 
-    async def _exit_trade(self, reason: str, exit_price: float):
-        """Exit current trade"""
+    async def _exit_trade(self, reason: str, index_exit_price: float):
+        """Exit current trade
+        
+        Args:
+            reason: Exit reason (SL Hit, Target Hit, etc.)
+            index_exit_price: Index price at exit (for logging)
+        """
         if not self.current_trade or self._exit_in_progress:
             return
         
         # Set exit lock immediately
         self._exit_in_progress = True
-            
+        
         qty = self.config['risk']['fixed_quantity']
-        pnl = 0.0
-        if self.current_trade.signal == SignalType.CE_BUY:
-            pnl = (exit_price - self.entry_price) * qty
+        
+        # Get actual OPTION LTP for real P&L calculation
+        option_exit_price = None
+        if self.active_option_token:
+            option_exit_price = await self._get_option_ltp(self.active_option_token)
+        
+        # Calculate P&L based on OPTION prices (not index!)
+        if option_exit_price and self.option_entry_price > 0:
+            # Real P&L from option premium difference
+            if self.current_trade.signal == SignalType.CE_BUY:
+                # CE: Profit when option price goes up
+                pnl = (option_exit_price - self.option_entry_price) * qty
+            else:
+                # PE: Profit when option price goes up (we bought PE)
+                pnl = (option_exit_price - self.option_entry_price) * qty
+            logger.info(f"💰 Option P&L: Entry={self.option_entry_price:.2f}, Exit={option_exit_price:.2f}, P&L=₹{pnl:.0f}")
         else:
-            pnl = (self.entry_price - exit_price) * qty
+            # Fallback: Estimate based on index move (rough approximation)
+            index_move = abs(index_exit_price - self.entry_price)
+            # Assume delta ~0.5 for ATM options
+            estimated_option_move = index_move * 0.5
+            if "SL" in reason:
+                pnl = -estimated_option_move * qty  # Loss
+            else:
+                pnl = estimated_option_move * qty  # Profit
+            logger.warning(f"⚠️ Using estimated P&L (option LTP unavailable): ₹{pnl:.0f}")
             
         # Notify strategy
         self.strategy.on_trade_exit(pnl)
         
-        # Log exit
+        # Log exit with OPTION prices
         log_trade_exit(
-            symbol=self.ce_symbol if self.current_trade.signal == SignalType.CE_BUY else self.pe_symbol,
-            entry=self.entry_price,
-            exit_price=exit_price,
+            symbol=self.active_option_symbol or "OPTION",
+            entry=self.option_entry_price,
+            exit_price=option_exit_price or self.option_entry_price,
             qty=qty,
             pnl=pnl,
             reason=reason
@@ -446,15 +499,19 @@ class AdaptiveTradingBot:
             await self.telegram._send_message(
                 f"{emoji} <b>TRADE EXIT</b>\n"
                 f"Reason: {reason}\n"
-                f"Entry: ₹{self.entry_price:.2f}\n"
-                f"Exit: ₹{exit_price:.2f}\n"
-                f"P&L: ₹{pnl:.2f}"
+                f"Option: {self.active_option_symbol}\n"
+                f"Entry: ₹{self.option_entry_price:.2f}\n"
+                f"Exit: ₹{option_exit_price:.2f if option_exit_price else 0:.2f}\n"
+                f"P&L: ₹{pnl:,.0f}"
             )
             
         # Clear state
         self.current_trade = None
         self.entry_order_id = None
         self.entry_price = 0.0
+        self.option_entry_price = 0.0
+        self.active_option_token = None
+        self.active_option_symbol = None
         self._exit_in_progress = False  # Release exit lock
         
     async def run(self):
