@@ -320,6 +320,10 @@ class AdaptiveTradingBot:
         if not can_trade:
             logger.warning(f"❌ Risk limits: {reason} - skipping trade")
             return
+        
+        # Re-select ATM strikes before each trade (dynamic ATM)
+        await self.select_strikes()
+        logger.info("🎯 ATM strikes re-selected for current price")
             
         # Select option based on signal
         if signal.signal == SignalType.CE_BUY:
