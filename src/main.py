@@ -555,6 +555,12 @@ class AdaptiveTradingBot:
                     if time_module.time() - last_heartbeat > 60:
                         logger.info(f"💓 Heartbeat: {tick_count} ticks processed | LTP: {tick.ltp:.2f}")
                         last_heartbeat = time_module.time()
+                    
+                    # Auto-exit and shutdown at 3:35 PM
+                    now_time = datetime.now().time()
+                    if now_time >= time(15, 35):
+                        logger.info("🕒 3:35 PM - Auto-shutdown triggered")
+                        break
                         
                     # Process tick only during market hours
                     if tick.token == self.index_token:
@@ -596,10 +602,21 @@ class AdaptiveTradingBot:
         if self.market_feed:
             self.market_feed.disconnect()
             
-        # Exit any open position
-        if self.current_trade:
-            logger.info("Exiting open position...")
-            # Would need current price here
+        # Exit any open position at market price
+        if self.current_trade and self.active_option_token:
+            logger.info("🚨 Exiting open position at market...")
+            try:
+                # Get current option price
+                option_ltp = await self._get_option_ltp(self.active_option_token)
+                if option_ltp:
+                    # Force exit
+                    self._exit_in_progress = False  # Reset lock
+                    await self._exit_trade("Auto-Exit (Shutdown)", self.entry_price)
+                    logger.info(f"✅ Position closed at ₹{option_ltp:.2f}")
+                else:
+                    logger.warning("⚠️ Could not get option LTP for exit")
+            except Exception as e:
+                logger.error(f"❌ Error closing position: {e}")
             
         # Final status
         if self.strategy:
