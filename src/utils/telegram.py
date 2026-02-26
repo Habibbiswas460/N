@@ -785,10 +785,10 @@ def initialize_telegram(
     bot_token: str,
     chat_id: str,
     enabled: bool = True
-) -> TelegramMenu:
+) -> TelegramNotifier:
     """Initialize Telegram with custom settings."""
     global _notifier
-    _notifier = TelegramMenu(
+    _notifier = TelegramNotifier(
         bot_token=bot_token,
         chat_id=chat_id,
         enabled=enabled

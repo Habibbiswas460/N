@@ -92,6 +92,9 @@ class AdaptiveTradingBot:
         # Market hours tracking
         self._logged_market_closed = False
         
+        # Exit lock to prevent duplicate exits
+        self._exit_in_progress = False
+        
     def is_market_open(self) -> bool:
         """Check if market is currently open for trading"""
         now = datetime.now().time()
@@ -347,6 +350,7 @@ class AdaptiveTradingBot:
                 self.current_trade = signal
                 self.entry_order_id = result.order_id
                 self.entry_price = signal.entry_price
+                self._exit_in_progress = False  # Reset exit lock for new trade
                 
                 # Set stop loss
                 self.sl_manager.initialize_sl(
@@ -407,8 +411,11 @@ class AdaptiveTradingBot:
                 
     async def _exit_trade(self, reason: str, exit_price: float):
         """Exit current trade"""
-        if not self.current_trade:
+        if not self.current_trade or self._exit_in_progress:
             return
+        
+        # Set exit lock immediately
+        self._exit_in_progress = True
             
         qty = self.config['risk']['fixed_quantity']
         pnl = 0.0
@@ -444,6 +451,7 @@ class AdaptiveTradingBot:
         self.current_trade = None
         self.entry_order_id = None
         self.entry_price = 0.0
+        self._exit_in_progress = False  # Release exit lock
         
     async def run(self):
         """Main trading loop"""
