@@ -70,3 +70,7 @@ htmlcov/
 Thumbs.db
 *.tmp
 *.temp
+
+# Archives
+_archive_*
+*.tar.gz

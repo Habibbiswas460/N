@@ -1,41 +1,39 @@
 """
-Adaptive Hybrid Strategy v1.0
-Professional trading strategy that adapts to market regimes
+VWAP + PDH/PDL Fusion Strategy
 
-Entry Criteria:
-- TRENDING: Momentum entries on pullbacks to VWAP
-- SIDEWAYS: Mean reversion at VAH/VAL levels
+High probability strategy (55-60% win rate) that combines:
+1. VWAP for directional bias confirmation
+2. PDH/PDL levels for entry triggers
 
-Features:
-- Dynamic SL based on ATR
-- VWAP-based directional bias
-- Volume Profile for key levels
-- Multi-factor confirmation
+Entry Logic:
+- LONG: Price > VWAP (stable) AND breaks above PDH
+- SHORT: Price < VWAP (stable) AND breaks below PDL
 """
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional, Dict, Any, Tuple
-from datetime import datetime, time, date
-import logging
 
-from indicators.vwap import VWAPIndicator
-from indicators.volume_profile import VolumeProfile
-from indicators.market_structure import MarketStructure
+import logging
+from datetime import datetime, time, date
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, List, Dict, Any
+from collections import deque
+
+from indicators.vwap import VWAPIndicator, VWAPData
+from indicators.market_structure import MarketStructure, MarketLevels
 from strategy.regime_detector import RegimeDetector, MarketRegime
 
 logger = logging.getLogger(__name__)
 
 
 class SignalType(Enum):
-    """Trading signal types"""
+    """Trade signal types"""
     NO_SIGNAL = "NO_SIGNAL"
-    CE_BUY = "CE_BUY"  # Bullish - Buy Call
-    PE_BUY = "PE_BUY"  # Bearish - Buy Put
+    CE_BUY = "CE_BUY"    # Bullish - Buy Call
+    PE_BUY = "PE_BUY"    # Bearish - Buy Put
 
 
 @dataclass
 class TradeSignal:
-    """Complete trade signal with all parameters"""
+    """Trade signal with entry/exit parameters"""
     signal: SignalType
     entry_price: float
     stop_loss: float
@@ -51,7 +49,7 @@ class TradeSignal:
     reason: str
     confidence: float
     
-    # Levels used
+    # Levels
     vwap: float
     poc: float
     vah: float
@@ -62,469 +60,413 @@ class TradeSignal:
 
 class AdaptiveHybridStrategy:
     """
-    Adaptive Hybrid Trading Strategy
+    VWAP + PDH/PDL Fusion Strategy
     
     Philosophy:
-    - In TRENDING markets: Trade with trend, enter on pullbacks
-    - In SIDEWAYS markets: Mean revert at value area boundaries
-    - AVOID trading in VOLATILE or UNKNOWN regimes
+    - Use VWAP to confirm directional BIAS (bullish/bearish)
+    - Use PDH/PDL break as TRIGGER for entry
+    - Combine both for high-probability setups
     
-    Key Indicators:
-    1. VWAP - Intraday directional bias
-    2. Volume Profile - Key support/resistance levels
-    3. Market Structure - PDH, PDL, swing points
-    4. Regime Detector - Market state classification
+    Entry Rules:
+    LONG (CE_BUY):
+        1. Price > VWAP for 3+ consecutive candles (bias confirmed)
+        2. Price breaks above PDH + buffer (trigger)
+        3. Time window: 9:30 - 14:00
+        
+    SHORT (PE_BUY):
+        1. Price < VWAP for 3+ consecutive candles (bias confirmed)
+        2. Price breaks below PDL - buffer (trigger)
+        3. Time window: 9:30 - 14:00
     
     Risk Management:
-    - ATR-based dynamic stop loss
-    - 1:2 minimum R:R for trades
-    - Maximum 3 trades per day
-    - 2% max daily loss
+    - SL at opposite PDH/PDL (conservative) or mid-point (aggressive)
+    - T1: 1.5x risk (exit 50%)
+    - T2: 2.5x risk (exit remaining)
     """
     
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize strategy with configuration"""
         config = config or {}
         
-        # Strategy parameters
-        self.atr_sl_multiplier = config.get('atr_sl_multiplier', 1.0)
-        self.min_rr_ratio = config.get('min_rr_ratio', 2.0)
+        # === Strategy Parameters ===
+        self.vwap_buffer = config.get('vwap_buffer', 5)           # Points above/below VWAP for bias
+        self.pdhl_buffer = config.get('pdhl_buffer', 5)           # Breakout buffer for PDH/PDL
+        self.vwap_stability = config.get('vwap_stability', 3)     # Candles to confirm VWAP position
+        self.sl_type = config.get('sl_type', 'conservative')      # 'conservative' or 'aggressive'
+        self.target_rr_1 = config.get('target_rr_1', 1.5)         # First target R:R
+        self.target_rr_2 = config.get('target_rr_2', 2.5)         # Second target R:R
+        self.min_rr_ratio = config.get('min_rr_ratio', 1.5)       # Minimum R:R to take trade
         self.max_trades_per_day = config.get('max_trades_per_day', 3)
-        self.max_daily_loss_pct = config.get('max_daily_loss_pct', 2.0)
-        self.signal_cooldown_minutes = config.get('signal_cooldown_minutes', 5)
-        self.min_confidence = config.get('min_confidence', 0.7)
+        self.atr_sl_multiplier = config.get('atr_sl_multiplier', 0.5)  # For ATR-based SL
         
-        # Time windows for trading
-        self.morning_start = time(9, 30)  # Wait 15 min after open
-        self.morning_end = time(11, 30)
-        self.afternoon_start = time(13, 0)
-        self.afternoon_end = time(15, 0)
+        # Multi-breakout mode: reset broken flags after trade exit to catch multiple breakouts
+        self.multi_breakout = config.get('multi_breakout', False)
+        self.cooldown_candles = config.get('cooldown_candles', 15)  # Candles to wait after exit
+        self.cooldown_candles = config.get('cooldown_candles', 15)  # Wait N candles after exit before re-entry
         
-        # Initialize indicators (1-minute)
-        self.vwap = VWAPIndicator()
-        self.volume_profile = VolumeProfile(tick_size=0.5)
-        self.market_structure = MarketStructure(swing_lookback=5)
+        # Fallback PDH/PDL levels
+        fallback_pdh = config.get('fallback_pdh', 0.0)
+        fallback_pdl = config.get('fallback_pdl', 0.0)
+        fallback_pdc = config.get('fallback_pdc', 0.0)
+        use_opening_range = config.get('use_opening_range', True)
+        
+        # Dynamic levels (rolling intraday high/low)
+        dynamic_levels = config.get('dynamic_levels', False)
+        dynamic_lookback = config.get('dynamic_lookback', 60)  # 60 candles = 1 hour
+        
+        # Time filters
+        self.entry_start = time(9, 30)    # Wait 15 min after open
+        self.entry_end = time(14, 0)      # No new trades after 2 PM
+        self.best_window_end = time(11, 30)  # Best trading window
+        
+        # === Initialize Indicators ===
+        self.vwap = VWAPIndicator(band_multiplier=1.0)
+        self.market_structure = MarketStructure(
+            swing_lookback=5, 
+            atr_period=14,
+            fallback_pdh=fallback_pdh,
+            fallback_pdl=fallback_pdl,
+            fallback_pdc=fallback_pdc,
+            use_opening_range=use_opening_range,
+            dynamic_levels=dynamic_levels,
+            dynamic_lookback=dynamic_lookback
+        )
         self.regime_detector = RegimeDetector(atr_period=14, lookback=20)
         
-        # 5-minute regime detector for confirmation
-        self.regime_detector_5m = RegimeDetector(atr_period=14, lookback=20)
-        self._5m_candle_count: int = 0
-        self._5m_high: float = 0.0
-        self._5m_low: float = float('inf')
-        self._5m_open: float = 0.0
-        self._5m_close: float = 0.0
-        
-        # State tracking
-        self._current_regime: MarketRegime = MarketRegime.UNKNOWN
-        self._last_signal_date: Optional[date] = None
-        self._last_signal_time: Optional[datetime] = None  # For cooldown
+        # === State Tracking ===
+        self._vwap_above_count: int = 0       # Consecutive candles above VWAP
+        self._vwap_below_count: int = 0       # Consecutive candles below VWAP
+        self._pdh_broken: bool = False        # Has PDH been broken today?
+        self._pdl_broken: bool = False        # Has PDL been broken today?
         self._trades_today: int = 0
         self._daily_pnl: float = 0.0
         self._in_trade: bool = False
-        self._last_signal: Optional[TradeSignal] = None
+        self._last_date: Optional[date] = None
+        self._cooldown_remaining: int = 0     # Candles remaining before re-entry allowed
         
-        # Current candle data
-        self._current_price: float = 0.0
-        self._current_high: float = 0.0
-        self._current_low: float = 0.0
+        # Current levels cache
+        self._current_vwap: float = 0.0
+        self._current_pdh: float = 0.0
+        self._current_pdl: float = 0.0
+        self._current_atr: float = 0.0
         
-        logger.info("AdaptiveHybridStrategy initialized with 5m confirmation")
-        
+        logger.info(f"Strategy initialized | VWAP buffer={self.vwap_buffer} | "
+                   f"PDH/PDL buffer={self.pdhl_buffer} | SL type={self.sl_type}")
+    
     def update(self, high: float, low: float, close: float, 
                volume: int, timestamp: datetime) -> Optional[TradeSignal]:
         """
-        Process new candle and generate signals
+        Process new candle and check for entry signals
         
         Args:
-            high: Candle high price
-            low: Candle low price
-            close: Candle close price
-            volume: Candle volume
+            high: Candle high
+            low: Candle low
+            close: Candle close
+            volume: Volume
             timestamp: Candle timestamp
             
         Returns:
-            TradeSignal if entry conditions met, None otherwise
+            TradeSignal if entry condition met, None otherwise
         """
-        # Update current price
-        self._current_price = close
-        self._current_high = high
-        self._current_low = low
+        # Reset for new day
+        self._check_day_reset(timestamp)
         
-        # Check for new day
-        current_date = timestamp.date()
-        if self._last_signal_date != current_date:
-            self._reset_daily()
-            self._last_signal_date = current_date
-            
-        # Update all indicators (1-minute)
-        self.vwap.update(high, low, close, volume, timestamp)
-        self.volume_profile.update(high, low, close, volume, timestamp)
-        self.market_structure.update(high, low, close, timestamp)
+        # Update indicators
+        vwap_data = self.vwap.update(high, low, close, volume, timestamp)
+        levels = self.market_structure.update(high, low, close, timestamp)
         regime_data = self.regime_detector.update(high, low, close, timestamp)
         
-        # Update 5-minute candle aggregation for confirmation
-        self._update_5m_candle(high, low, close, timestamp)
+        # Cache current values
+        if vwap_data:
+            self._current_vwap = vwap_data.vwap
+        if levels:
+            self._current_pdh = levels.pdh
+            self._current_pdl = levels.pdl
+        self._current_atr = self.regime_detector.get_atr()
         
-        self._current_regime = regime_data.regime
-        
-        # Check trading conditions
-        if not self._can_trade(timestamp):
+        # Need levels to trade
+        if not levels or not vwap_data:
             return None
-            
-        # Get 5-minute regime for confirmation
-        regime_5m = self.regime_detector_5m.get_regime()
         
-        # Generate signal based on regime (with 5m confirmation)
-        signal = self._generate_signal(timestamp, regime_data, regime_5m)
+        # Check if we should trade
+        if not self._should_trade(timestamp, regime_data):
+            return None
         
-        if signal and signal.signal != SignalType.NO_SIGNAL:
-            self._last_signal = signal
-            logger.info(f"SIGNAL: {signal.signal.value} | Price={close} | "
-                       f"SL={signal.stop_loss} | T1={signal.target_1} | "
-                       f"Regime={signal.regime} | Reason={signal.reason}")
+        # Update VWAP position tracking
+        self._update_vwap_position(close, vwap_data.vwap)
+        
+        # Check for entry signals
+        signal = self._check_entry_signal(close, vwap_data, levels, regime_data, timestamp)
         
         return signal
+    
+    def _check_day_reset(self, timestamp: datetime):
+        """Reset state for new trading day"""
+        current_date = timestamp.date()
         
-    def _update_5m_candle(self, high: float, low: float, close: float, timestamp: datetime):
-        """Aggregate 1-minute candles into 5-minute for confirmation"""
-        self._5m_candle_count += 1
-        
-        if self._5m_candle_count == 1:
-            self._5m_open = close  # Use close as proxy for open
-            self._5m_high = high
-            self._5m_low = low
-        else:
-            self._5m_high = max(self._5m_high, high)
-            self._5m_low = min(self._5m_low, low)
+        if self._last_date is not None and current_date != self._last_date:
+            logger.info(f"New trading day detected - resetting state")
+            self._vwap_above_count = 0
+            self._vwap_below_count = 0
+            self._pdh_broken = False
+            self._pdl_broken = False
+            self._trades_today = 0
+            self._daily_pnl = 0.0
+            self._cooldown_remaining = 0
             
-        self._5m_close = close
+        self._last_date = current_date
+    
+    def _should_trade(self, timestamp: datetime, regime_data) -> bool:
+        """Check if we should look for trades"""
+        current_time = timestamp.time()
         
-        # Every 5 candles, update 5-min regime detector
-        if self._5m_candle_count >= 5:
-            self.regime_detector_5m.update(
-                self._5m_high, self._5m_low, self._5m_close, timestamp
-            )
-            # Reset for next 5-min candle
-            self._5m_candle_count = 0
-            self._5m_high = 0.0
-            self._5m_low = float('inf')
-            
-    def _can_trade(self, timestamp: datetime) -> bool:
-        """Check if trading is allowed"""
+        # Time filter
+        if current_time < self.entry_start or current_time > self.entry_end:
+            return False
+        
         # Max trades check
         if self._trades_today >= self.max_trades_per_day:
             return False
-            
+        
         # Already in trade
         if self._in_trade:
             return False
-            
-        # Signal cooldown check
-        if self._last_signal_time:
-            time_since_signal = (timestamp - self._last_signal_time).total_seconds() / 60
-            if time_since_signal < self.signal_cooldown_minutes:
-                return False
-            
-        # Time window check
-        current_time = timestamp.time()
-        in_morning = self.morning_start <= current_time <= self.morning_end
-        in_afternoon = self.afternoon_start <= current_time <= self.afternoon_end
         
-        if not (in_morning or in_afternoon):
+        # Cooldown after previous trade exit
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
             return False
-            
+        
+        # Avoid volatile regime
+        if regime_data and regime_data.regime == MarketRegime.VOLATILE:
+            logger.debug(f"Skipping - VOLATILE regime detected")
+            return False
+        
         return True
-        
-    def _generate_signal(self, timestamp: datetime, 
-                         regime_data, regime_5m: MarketRegime = None) -> Optional[TradeSignal]:
-        """Generate trading signal based on current market state"""
-        
-        # Skip if regime is not tradeable
-        if not regime_data.is_tradeable:
-            return self._no_signal(timestamp, f"Regime not tradeable: {regime_data.regime.value}")
-            
-        # Skip if confidence is too low
-        if regime_data.confidence < self.min_confidence:
-            return self._no_signal(timestamp, f"Low confidence: {regime_data.confidence:.0%}")
-            
-        # 5-minute confirmation: Check if 1m and 5m regimes align
-        if regime_5m and regime_5m != MarketRegime.UNKNOWN:
-            # For trending signals, 5m should also be trending (or at least not opposite)
-            if regime_data.is_trending:
-                if regime_5m == MarketRegime.VOLATILE:
-                    return self._no_signal(timestamp, "5m shows VOLATILE - skip")
-                # Allow if 5m is same direction or sideways
-                if regime_data.regime == MarketRegime.TRENDING_UP and regime_5m == MarketRegime.TRENDING_DOWN:
-                    return self._no_signal(timestamp, "5m trend conflict - 1m UP but 5m DOWN")
-                if regime_data.regime == MarketRegime.TRENDING_DOWN and regime_5m == MarketRegime.TRENDING_UP:
-                    return self._no_signal(timestamp, "5m trend conflict - 1m DOWN but 5m UP")
-            
-        # Get indicator values
-        vwap_data = self.vwap.get_current_vwap()
-        vp_levels = self.volume_profile._calculate_levels()
-        ms_levels = self.market_structure._calculate_levels()
-        atr = self.regime_detector.get_atr()
-        
-        if vwap_data is None or vp_levels is None or atr == 0:
-            return self._no_signal(timestamp, "Insufficient indicator data")
-            
-        # ms_levels can be None if we don't have previous day data - that's ok
-        # We only need it for PDH/PDL levels which are optional
-            
-        # Determine trading approach based on regime
-        if regime_data.is_trending:
-            return self._trending_signal(timestamp, regime_data, vwap_data, 
-                                        vp_levels, ms_levels, atr)
-        elif regime_data.is_sideways:
-            return self._sideways_signal(timestamp, regime_data, vwap_data,
-                                        vp_levels, ms_levels, atr)
+    
+    def _update_vwap_position(self, close: float, vwap: float):
+        """Track consecutive candles above/below VWAP"""
+        if close > vwap + self.vwap_buffer:
+            self._vwap_above_count += 1
+            self._vwap_below_count = 0
+        elif close < vwap - self.vwap_buffer:
+            self._vwap_below_count += 1
+            self._vwap_above_count = 0
         else:
-            return self._no_signal(timestamp, f"Unknown regime: {regime_data.regime.value}")
-            
-    def _trending_signal(self, timestamp: datetime, regime_data,
-                         vwap: float, vp_levels,
-                         ms_levels, atr: float) -> Optional[TradeSignal]:
+            # At VWAP - reset both (no clear bias)
+            self._vwap_above_count = 0
+            self._vwap_below_count = 0
+    
+    def _check_entry_signal(self, close: float, vwap_data: VWAPData, 
+                            levels: MarketLevels, regime_data,
+                            timestamp: datetime) -> Optional[TradeSignal]:
         """
-        Generate signal for trending markets
+        Check for VWAP + PDH/PDL confluence entry
         
-        Strategy: Trade with trend on pullbacks to VWAP
-        - UPTREND: Buy CE on pullback to VWAP (price near or slightly below)
-        - DOWNTREND: Buy PE on pullback to VWAP (price near or slightly above)
+        Returns TradeSignal if conditions met
         """
-        price = self._current_price
-        poc = vp_levels.poc
-        vah = vp_levels.vah
-        val = vp_levels.val
+        vwap = vwap_data.vwap
+        pdh = levels.pdh
+        pdl = levels.pdl
+        atr = self._current_atr or 20  # Default ATR if not calculated
         
-        # Calculate SL and targets
-        sl_distance = atr * self.atr_sl_multiplier
-        
-        if regime_data.regime == MarketRegime.TRENDING_UP:
-            # Look for pullback to VWAP or VAL
-            vwap_distance = (price - vwap) / vwap * 100
-            
-            # Price should be at or slightly below VWAP
-            if -0.15 <= vwap_distance <= 0.10:
-                # Pullback to VWAP - good entry
-                sl = price - sl_distance
-                target1 = price + sl_distance * 2  # 1:2 R:R
-                target2 = price + sl_distance * 3  # 1:3 R:R
+        # ===== LONG ENTRY (CE_BUY) =====
+        # Condition 1: Price above VWAP for stability period (bullish bias)
+        # Condition 2: Price breaks above PDH (trigger)
+        if self._vwap_above_count >= self.vwap_stability:
+            if close > pdh + self.pdhl_buffer and not self._pdh_broken:
+                self._pdh_broken = True
                 
-                # Check R:R
-                risk = price - sl
-                reward = target1 - price
-                rr = reward / risk if risk > 0 else 0
+                # Calculate SL
+                if self.sl_type == 'aggressive':
+                    sl = (pdh + pdl) / 2 - 3  # Midpoint with buffer
+                else:
+                    sl = pdl - 5  # Conservative - below PDL
                 
-                if rr >= self.min_rr_ratio:
-                    return TradeSignal(
-                        signal=SignalType.CE_BUY,
-                        entry_price=price,
-                        stop_loss=round(sl, 2),
-                        target_1=round(target1, 2),
-                        target_2=round(target2, 2),
-                        risk_points=round(risk, 2),
-                        reward_ratio=round(rr, 2),
-                        regime=regime_data.regime.value,
-                        reason=f"Uptrend pullback to VWAP ({vwap_distance:.2f}%)",
-                        confidence=regime_data.confidence,
-                        vwap=round(vwap, 2),
-                        poc=round(poc, 2),
-                        vah=round(vah, 2),
-                        val=round(val, 2),
-                        timestamp=timestamp
-                    )
-                    
-        elif regime_data.regime == MarketRegime.TRENDING_DOWN:
-            # Price should be at or slightly above VWAP
-            vwap_distance = (price - vwap) / vwap * 100
-            
-            if -0.10 <= vwap_distance <= 0.15:
-                # Pullback to VWAP - good entry for short
-                sl = price + sl_distance
-                target1 = price - sl_distance * 2
-                target2 = price - sl_distance * 3
+                # ATR-based SL if tighter
+                atr_sl = close - (atr * self.atr_sl_multiplier)
+                sl = max(sl, atr_sl)  # Use whichever is closer/tighter
                 
-                risk = sl - price
-                reward = price - target1
-                rr = reward / risk if risk > 0 else 0
+                risk = close - sl
                 
-                if rr >= self.min_rr_ratio:
-                    return TradeSignal(
-                        signal=SignalType.PE_BUY,
-                        entry_price=price,
-                        stop_loss=round(sl, 2),
-                        target_1=round(target1, 2),
-                        target_2=round(target2, 2),
-                        risk_points=round(risk, 2),
-                        reward_ratio=round(rr, 2),
-                        regime=regime_data.regime.value,
-                        reason=f"Downtrend pullback to VWAP ({vwap_distance:.2f}%)",
-                        confidence=regime_data.confidence,
-                        vwap=round(vwap, 2),
-                        poc=round(poc, 2),
-                        vah=round(vah, 2),
-                        val=round(val, 2),
-                        timestamp=timestamp
-                    )
-                    
-        return self._no_signal(timestamp, "No trending entry condition met")
-        
-    def _sideways_signal(self, timestamp: datetime, regime_data,
-                         vwap: float, vp_levels,
-                         ms_levels, atr: float) -> Optional[TradeSignal]:
-        """
-        Generate signal for sideways markets
-        
-        Strategy: Mean reversion at value area boundaries
-        - At VAL (Value Area Low): Buy CE (expect bounce up to POC)
-        - At VAH (Value Area High): Buy PE (expect drop to POC)
-        """
-        price = self._current_price
-        poc = vp_levels.poc
-        vah = vp_levels.vah
-        val = vp_levels.val
-        
-        # Tolerance for level detection (higher in sideways)
-        tolerance = atr * 0.3
-        sl_distance = atr * self.atr_sl_multiplier
-        
-        # Check if at VAL (potential long)
-        if abs(price - val) <= tolerance:
-            # Mean reversion long at VAL
-            sl = val - sl_distance
-            target1 = poc  # First target at POC
-            target2 = vah  # Extended target at VAH
-            
-            risk = price - sl
-            reward = target1 - price
-            rr = reward / risk if risk > 0 else 0
-            
-            # Must be above VWAP or at least neutral for bullish setup
-            vwap_bias = self.vwap.get_bias(price)
-            
-            if rr >= self.min_rr_ratio and vwap_bias != "BEARISH":
+                # Skip if R:R not favorable
+                potential_target = close + risk * self.target_rr_1
+                if risk <= 0 or risk > 50:  # Sanity check
+                    logger.warning(f"Skipping LONG - invalid risk: {risk:.2f}")
+                    return None
+                
+                # Calculate targets
+                target_1 = close + risk * self.target_rr_1
+                target_2 = close + risk * self.target_rr_2
+                
+                # Confidence based on regime
+                confidence = 0.70
+                if regime_data and regime_data.is_trending:
+                    confidence = 0.80
+                
+                # Boost confidence in best window
+                if timestamp.time() <= self.best_window_end:
+                    confidence = min(0.90, confidence + 0.10)
+                
+                reason = f"VWAP+PDH Breakout | VWAP bias {self._vwap_above_count} candles | PDH={pdh:.2f}"
+                
+                logger.info(f"🟢 LONG SIGNAL | Entry={close:.2f} | SL={sl:.2f} | "
+                           f"T1={target_1:.2f} | T2={target_2:.2f} | Risk={risk:.2f}")
+                
                 return TradeSignal(
                     signal=SignalType.CE_BUY,
-                    entry_price=price,
-                    stop_loss=round(sl, 2),
-                    target_1=round(target1, 2),
-                    target_2=round(target2, 2),
-                    risk_points=round(risk, 2),
-                    reward_ratio=round(rr, 2),
-                    regime=regime_data.regime.value,
-                    reason=f"Mean reversion at VAL ({val:.2f})",
-                    confidence=regime_data.confidence,
-                    vwap=round(vwap, 2),
-                    poc=round(poc, 2),
-                    vah=round(vah, 2),
-                    val=round(val, 2),
+                    entry_price=close,
+                    stop_loss=sl,
+                    target_1=target_1,
+                    target_2=target_2,
+                    risk_points=risk,
+                    reward_ratio=self.target_rr_1,
+                    regime=regime_data.regime.value if regime_data else "UNKNOWN",
+                    reason=reason,
+                    confidence=confidence,
+                    vwap=vwap,
+                    poc=(pdh + pdl) / 2,  # Using midpoint as POC proxy
+                    vah=pdh,
+                    val=pdl,
                     timestamp=timestamp
                 )
+        
+        # ===== SHORT ENTRY (PE_BUY) =====
+        # Condition 1: Price below VWAP for stability period (bearish bias)
+        # Condition 2: Price breaks below PDL (trigger)
+        if self._vwap_below_count >= self.vwap_stability:
+            if close < pdl - self.pdhl_buffer and not self._pdl_broken:
+                self._pdl_broken = True
                 
-        # Check if at VAH (potential short)
-        elif abs(price - vah) <= tolerance:
-            # Mean reversion short at VAH
-            sl = vah + sl_distance
-            target1 = poc
-            target2 = val
-            
-            risk = sl - price
-            reward = price - target1
-            rr = reward / risk if risk > 0 else 0
-            
-            vwap_bias = self.vwap.get_bias(price)
-            
-            if rr >= self.min_rr_ratio and vwap_bias != "BULLISH":
+                # Calculate SL
+                if self.sl_type == 'aggressive':
+                    sl = (pdh + pdl) / 2 + 3  # Midpoint with buffer
+                else:
+                    sl = pdh + 5  # Conservative - above PDH
+                
+                # ATR-based SL if tighter
+                atr_sl = close + (atr * self.atr_sl_multiplier)
+                sl = min(sl, atr_sl)  # Use whichever is closer/tighter
+                
+                risk = sl - close
+                
+                # Skip if R:R not favorable
+                if risk <= 0 or risk > 50:
+                    logger.warning(f"Skipping SHORT - invalid risk: {risk:.2f}")
+                    return None
+                
+                # Calculate targets
+                target_1 = close - risk * self.target_rr_1
+                target_2 = close - risk * self.target_rr_2
+                
+                # Confidence based on regime
+                confidence = 0.70
+                if regime_data and regime_data.is_trending:
+                    confidence = 0.80
+                
+                # Boost confidence in best window
+                if timestamp.time() <= self.best_window_end:
+                    confidence = min(0.90, confidence + 0.10)
+                
+                reason = f"VWAP+PDL Breakdown | VWAP bias {self._vwap_below_count} candles | PDL={pdl:.2f}"
+                
+                logger.info(f"🔴 SHORT SIGNAL | Entry={close:.2f} | SL={sl:.2f} | "
+                           f"T1={target_1:.2f} | T2={target_2:.2f} | Risk={risk:.2f}")
+                
                 return TradeSignal(
                     signal=SignalType.PE_BUY,
-                    entry_price=price,
-                    stop_loss=round(sl, 2),
-                    target_1=round(target1, 2),
-                    target_2=round(target2, 2),
-                    risk_points=round(risk, 2),
-                    reward_ratio=round(rr, 2),
-                    regime=regime_data.regime.value,
-                    reason=f"Mean reversion at VAH ({vah:.2f})",
-                    confidence=regime_data.confidence,
-                    vwap=round(vwap, 2),
-                    poc=round(poc, 2),
-                    vah=round(vah, 2),
-                    val=round(val, 2),
+                    entry_price=close,
+                    stop_loss=sl,
+                    target_1=target_1,
+                    target_2=target_2,
+                    risk_points=risk,
+                    reward_ratio=self.target_rr_1,
+                    regime=regime_data.regime.value if regime_data else "UNKNOWN",
+                    reason=reason,
+                    confidence=confidence,
+                    vwap=vwap,
+                    poc=(pdh + pdl) / 2,
+                    vah=pdh,
+                    val=pdl,
                     timestamp=timestamp
                 )
-                
-        return self._no_signal(timestamp, "No sideways entry condition met")
         
-    def _no_signal(self, timestamp: datetime, reason: str) -> TradeSignal:
-        """Create no-signal result"""
-        return TradeSignal(
-            signal=SignalType.NO_SIGNAL,
-            entry_price=self._current_price,
-            stop_loss=0,
-            target_1=0,
-            target_2=0,
-            risk_points=0,
-            reward_ratio=0,
-            regime=self._current_regime.value,
-            reason=reason,
-            confidence=0,
-            vwap=self.vwap.get_current_vwap() or 0,
-            poc=0,
-            vah=0,
-            val=0,
-            timestamp=timestamp
-        )
-        
-    def _reset_daily(self):
-        """Reset daily counters"""
-        self._trades_today = 0
-        self._daily_pnl = 0.0
-        self._in_trade = False
-        self._last_signal_time = None
-        self._5m_candle_count = 0
-        self._5m_high = 0.0
-        self._5m_low = float('inf')
-        logger.info("AdaptiveHybridStrategy: Daily reset")
-        
-    def on_trade_entry(self, timestamp: datetime = None):
+        return None
+    
+    def on_trade_entry(self):
         """Called when trade is entered"""
         self._in_trade = True
         self._trades_today += 1
-        if timestamp:
-            self._last_signal_time = timestamp
-        logger.info(f"Trade entered. Trades today: {self._trades_today}")
+        logger.info(f"Trade entered | Trades today: {self._trades_today}")
+    
+    def on_trade_exit(self, pnl_or_is_win=0.0):
+        """
+        Called when trade is exited
         
-    def on_trade_exit(self, pnl: float):
-        """Called when trade is exited"""
+        Args:
+            pnl_or_is_win: Either PnL amount (float) or is_win flag (bool)
+        """
         self._in_trade = False
+        
+        # Support both pnl (float) and is_win (bool) parameters
+        if isinstance(pnl_or_is_win, bool):
+            pnl = 0.0  # Backtest doesn't track PnL here
+            is_win = pnl_or_is_win
+        else:
+            pnl = pnl_or_is_win
+            is_win = pnl > 0
+            
         self._daily_pnl += pnl
-        logger.info(f"Trade exited. PnL: {pnl}, Daily PnL: {self._daily_pnl}")
         
-    def get_regime(self) -> MarketRegime:
-        """Get current market regime"""
-        return self._current_regime
+        # Multi-breakout mode: reset broken flags to allow catching more breakouts
+        if self.multi_breakout:
+            self._pdh_broken = False
+            self._pdl_broken = False
+            self._cooldown_remaining = self.cooldown_candles  # Wait N candles before re-entry
+            logger.debug(f"Multi-breakout mode: Reset flags, cooldown={self.cooldown_candles}")
         
-    def get_last_signal(self) -> Optional[TradeSignal]:
-        """Get last generated signal"""
-        return self._last_signal
-        
+        logger.info(f"Trade exited | PnL: {pnl:.2f} | Daily PnL: {self._daily_pnl:.2f}")
+    
     def get_status(self) -> Dict[str, Any]:
         """Get current strategy status"""
+        # Get current regime from detector
+        regime_data = self.regime_detector.get_regime()
+        regime_str = regime_data.value if regime_data else "UNKNOWN"
+        
         return {
-            'regime': self._current_regime.value,
             'trades_today': self._trades_today,
             'daily_pnl': self._daily_pnl,
             'in_trade': self._in_trade,
-            'vwap': self.vwap.get_current_vwap(),
-            'atr': self.regime_detector.get_atr()
+            'vwap_above_count': self._vwap_above_count,
+            'vwap_below_count': self._vwap_below_count,
+            'pdh_broken': self._pdh_broken,
+            'pdl_broken': self._pdl_broken,
+            'current_vwap': self._current_vwap,
+            'current_pdh': self._current_pdh,
+            'current_pdl': self._current_pdl,
+            'current_atr': self._current_atr,
+            # For main.py compatibility
+            'regime': regime_str,
+            'vwap': self._current_vwap,
+            'atr': self._current_atr
         }
-        
-    def reset(self):
-        """Full strategy reset"""
-        self.vwap.reset()
-        self.volume_profile.reset()
-        self.market_structure.reset()
-        self.regime_detector.reset()
-        self._current_regime = MarketRegime.UNKNOWN
-        self._reset_daily()
-        logger.info("AdaptiveHybridStrategy: Full reset")
+    
+    def reset_daily(self):
+        """Reset for new day"""
+        self._trades_today = 0
+        self._daily_pnl = 0.0
+        self._in_trade = False
+        self._vwap_above_count = 0
+        self._vwap_below_count = 0
+        self._pdh_broken = False
+        self._pdl_broken = False
+        logger.info("Strategy daily reset complete")
+    
+    def get_levels(self) -> Dict[str, float]:
+        """Get current key levels for display"""
+        return {
+            'vwap': self._current_vwap,
+            'pdh': self._current_pdh,
+            'pdl': self._current_pdl,
+            'atr': self._current_atr
+        }

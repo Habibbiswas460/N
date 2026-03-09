@@ -14,6 +14,7 @@ Trading Flow:
 - 3:30 PM: Auto exit and shutdown
 """
 
+import argparse
 import asyncio
 import signal
 import sys
@@ -30,6 +31,7 @@ from utils import now_ist, today_ist, IST
 from broker.auth import AngelOneAuth
 from data.instrument_master import InstrumentMaster, OptionType
 from data.market_feed import MarketFeed, SubscriptionMode
+from data.market_feed_polling import PollingMarketFeed
 from data.candle_builder import CandleAggregator, Candle
 from data.dynamic_strike_selector import DynamicStrikeSelector, initialize_dynamic_strike_selector
 from execution.order_manager import OrderManager, OrderRequest, OrderType, TransactionType, ProductType
@@ -41,6 +43,8 @@ from utils.telegram import TelegramNotifier, initialize_telegram
 # New Strategy Components
 from strategy.adaptive_hybrid import AdaptiveHybridStrategy, TradeSignal, SignalType
 from strategy.regime_detector import MarketRegime
+from core.database import get_database, TradingDatabase
+from backtest.historical_data import HistoricalDataFetcher
 
 from loguru import logger
 
@@ -56,9 +60,11 @@ class AdaptiveTradingBot:
     4. ATR-based dynamic risk management
     """
     
-    def __init__(self, config_path: str = "config/settings.yaml"):
+    def __init__(self, config_path: str = "config/settings.yaml", use_polling: bool = False, paper_mode: bool = False):
         self.config_path = config_path
         self.config: Dict[str, Any] = {}
+        self.use_polling = use_polling  # Use REST API polling instead of WebSocket
+        self.force_paper_mode = paper_mode  # Force paper trading from command line
         self._shutdown_flag = False
         self._running = False
         
@@ -100,12 +106,69 @@ class AdaptiveTradingBot:
         # Exit lock to prevent duplicate exits
         self._exit_in_progress = False
         
+        # Database
+        self.db: Optional[TradingDatabase] = None
+        self.session_id: Optional[int] = None
+        self.current_trade_id: Optional[int] = None
+        
     def is_market_open(self) -> bool:
         """Check if market is currently open for trading"""
         now = datetime.now().time()
         market_open = time(9, 15)
         market_close = time(15, 30)
         return market_open <= now <= market_close
+    
+    def _fetch_previous_day_levels(self) -> Dict[str, float]:
+        """
+        Fetch previous day's High, Low, Close from Angel One API.
+        Falls back to config values if API call fails.
+        
+        Returns:
+            Dict with 'pdh', 'pdl', 'pdc' keys
+        """
+        try:
+            logger.info("📊 Fetching previous day levels from API...")
+            
+            fetcher = HistoricalDataFetcher(self.auth.smart_api)
+            
+            # Fetch last 3 days of daily candles to ensure we get previous trading day
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=5)  # Buffer for weekends/holidays
+            
+            candles = fetcher.fetch_candles(
+                exchange="NSE",
+                symbol="Nifty 50",
+                token="99926000",
+                interval="ONE_DAY",
+                from_date=from_date,
+                to_date=to_date
+            )
+            
+            if candles and len(candles) >= 2:
+                # Get previous completed day (second last candle since today is incomplete)
+                prev_day = candles[-2] if len(candles) > 1 else candles[-1]
+                
+                pdh = prev_day.high
+                pdl = prev_day.low
+                pdc = prev_day.close
+                
+                logger.info(f"✅ Live PDH/PDL fetched | PDH: {pdh:.2f} | PDL: {pdl:.2f} | PDC: {pdc:.2f}")
+                logger.info(f"   Previous day: {prev_day.timestamp.date()}")
+                
+                return {'pdh': pdh, 'pdl': pdl, 'pdc': pdc}
+            else:
+                logger.warning("⚠️ Not enough candle data from API, using config fallback")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch previous day levels: {e}")
+        
+        # Fallback to config values
+        market_structure_config = self.config['strategy'].get('market_structure', {})
+        return {
+            'pdh': market_structure_config.get('fallback_pdh', 0.0),
+            'pdl': market_structure_config.get('fallback_pdl', 0.0),
+            'pdc': market_structure_config.get('fallback_pdc', 0.0)
+        }
     
     def load_config(self) -> Dict[str, Any]:
         """Load configuration from YAML file"""
@@ -142,12 +205,42 @@ class AdaptiveTradingBot:
         # Get index token
         self.index_token = self.config['index']['token']
         
+        # Get market structure config
+        market_structure_config = self.config['strategy'].get('market_structure', {})
+        
+        # Check if we should fetch previous day levels from API
+        # If false, bot will use TODAY's opening range (first 15 min) as support/resistance
+        fetch_from_api = market_structure_config.get('fetch_prev_day_from_api', False)
+        
+        if fetch_from_api:
+            # Fetch live previous day levels from API
+            prev_day_levels = self._fetch_previous_day_levels()
+        else:
+            # Use config fallbacks (0 = will use today's opening range)
+            prev_day_levels = {
+                'pdh': market_structure_config.get('fallback_pdh', 0.0),
+                'pdl': market_structure_config.get('fallback_pdl', 0.0),
+                'pdc': market_structure_config.get('fallback_pdc', 0.0)
+            }
+            logger.info("📊 Using TODAY's Opening Range (9:15-9:30) for support/resistance")
+        
         # Initialize strategy with config
         strategy_config = {
             'atr_sl_multiplier': self.config['strategy']['entry'].get('atr_sl_multiplier', 1.0),
             'min_rr_ratio': self.config['strategy']['entry'].get('min_rr_ratio', 2.0),
             'max_trades_per_day': self.config['strategy']['entry'].get('max_trades_per_day', 3),
             'max_daily_loss_pct': self.config['strategy']['entry'].get('max_daily_loss_pct', 2.0),
+            # PDH/PDL levels (0 = use today's opening range)
+            'fallback_pdh': prev_day_levels['pdh'],
+            'fallback_pdl': prev_day_levels['pdl'],
+            'fallback_pdc': prev_day_levels['pdc'],
+            'use_opening_range': market_structure_config.get('use_opening_range', True),
+            # Dynamic levels (rolling intraday high/low)
+            'dynamic_levels': market_structure_config.get('dynamic_levels', False),
+            'dynamic_lookback': market_structure_config.get('dynamic_lookback', 60),
+            # Multi-breakout mode
+            'multi_breakout': self.config['strategy']['entry'].get('multi_breakout', False),
+            'cooldown_candles': self.config['strategy']['entry'].get('cooldown_candles', 15),
         }
         self.strategy = AdaptiveHybridStrategy(strategy_config)
         logger.info("✅ Adaptive Hybrid Strategy initialized")
@@ -215,6 +308,11 @@ class AdaptiveTradingBot:
         )
         logger.info("✅ Candle builder initialized")
         
+        # Initialize database and start session
+        self.db = get_database()
+        self.session_id = self.db.start_session(market_open=0.0)
+        logger.info(f"✅ Database initialized, session #{self.session_id}")
+        
         log_banner("INITIALIZATION COMPLETE")
         
     async def select_strikes(self):
@@ -230,6 +328,26 @@ class AdaptiveTradingBot:
         index_ltp = await self._get_index_ltp()
         if not index_ltp:
             raise RuntimeError("Failed to get index LTP")
+
+        # Recover open trades from previous session
+        last_session = self.db.get_last_session()
+        if last_session and last_session['status'] != 'COMPLETED':
+            open_trades = self.db.get_open_trades(session_id=last_session['id'])
+            if open_trades:
+                logger.warning(f"⚠️ Found {len(open_trades)} open trade(s) from previous session #{last_session['id']}. Recovering...")
+                for trade in open_trades:
+                    # Force close at market price
+                    option_ltp = await self._get_option_ltp(trade['symbol'])
+                    exit_price = option_ltp or trade['entry_price']
+                    self.db.close_trade(
+                        trade_id=trade['id'],
+                        exit_price=exit_price,
+                        exit_reason="Auto-Exit (Recovery)",
+                        status="CLOSED_RECOVERY"
+                    )
+                    logger.info(f"✅ Trade #{trade['id']} closed at ₹{exit_price:.2f} (Recovery)")
+                self.db.end_session(last_session['id'], market_close=0.0)
+                logger.info(f"📝 Previous session #{last_session['id']} ended after recovery.")
         
         logger.info(f"📊 Index LTP: {index_ltp:.2f}")
         
@@ -383,17 +501,35 @@ class AdaptiveTradingBot:
                 self.option_entry_price = option_ltp if option_ltp else 100.0  # Fallback
                 logger.info(f"💰 Option Entry LTP: ₹{self.option_entry_price:.2f}")
                 
-                # Set stop loss
+                # Set stop loss (use strategy's ATR-based SL)
                 self.sl_manager.initialize_sl(
                     symbol=option_symbol,
                     token=option_token,
                     exchange="NFO",
                     quantity=self.config['risk']['fixed_quantity'],
-                    entry_price=signal.entry_price
+                    entry_price=signal.entry_price,
+                    stop_loss=signal.stop_loss  # ATR-based SL from strategy
                 )
                 
                 # Notify strategy
                 self.strategy.on_trade_entry()
+                
+                # Save trade to database
+                if self.db and self.session_id:
+                    self.current_trade_id = self.db.add_trade(
+                        session_id=self.session_id,
+                        direction=signal.signal.value,  # CE_BUY or PE_BUY
+                        strike=int(signal.entry_price),  # Use index price as strike reference
+                        entry_price=self.option_entry_price,
+                        quantity=self.config['risk']['fixed_quantity'],
+                        symbol=option_symbol,
+                        regime=str(signal.regime),
+                        regime_confidence=signal.confidence,
+                        vwap=signal.entry_price,  # Using entry price as VWAP reference
+                        vwap_position="ABOVE" if signal.signal == SignalType.CE_BUY else "BELOW",
+                        sl_price=signal.stop_loss
+                    )
+                    logger.info(f"📝 Trade #{self.current_trade_id} saved to database")
                 
                 # Log and notify (using option price)
                 log_trade_entry(
@@ -484,6 +620,18 @@ class AdaptiveTradingBot:
         # Notify strategy
         self.strategy.on_trade_exit(pnl)
         
+        # Save exit to database
+        if self.db and self.current_trade_id:
+            status = "CLOSED_SL" if "SL" in reason else "CLOSED_TP"
+            self.db.close_trade(
+                trade_id=self.current_trade_id,
+                exit_price=option_exit_price or self.option_entry_price,
+                exit_reason=reason,
+                status=status
+            )
+            logger.info(f"📝 Trade #{self.current_trade_id} closed in database")
+            self.current_trade_id = None
+        
         # Log exit with OPTION prices
         log_trade_exit(
             symbol=self.active_option_symbol or "OPTION",
@@ -501,7 +649,7 @@ class AdaptiveTradingBot:
                 f"Reason: {reason}\n"
                 f"Option: {self.active_option_symbol}\n"
                 f"Entry: ₹{self.option_entry_price:.2f}\n"
-                f"Exit: ₹{option_exit_price:.2f if option_exit_price else 0:.2f}\n"
+                f"Exit: ₹{(option_exit_price or 0):.2f}\n"
                 f"P&L: ₹{pnl:,.0f}"
             )
             
@@ -523,20 +671,36 @@ class AdaptiveTradingBot:
             log_banner("TRADING STARTED")
             self._running = True
             
-            # Initialize market feed
-            self.market_feed = MarketFeed(
-                auth_token=self.auth.jwt_token,
-                api_key=self.auth.api_key,
-                client_code=self.auth.client_code,
-                feed_token=self.auth.feed_token
-            )
-            self.market_feed.connect()
-            
-            # Subscribe to index
-            self.market_feed.subscribe_index(
-                token=self.index_token,
-                mode=SubscriptionMode.LTP
-            )
+            # Initialize market feed - WebSocket or Polling based on flag
+            if self.use_polling:
+                logger.info("📊 Using REST API Polling (--polling mode)")
+                self.market_feed = PollingMarketFeed(
+                    smart_api=self.auth.smart_api,
+                    poll_interval=2.0,  # Poll every 2 seconds
+                    broker=self.auth
+                )
+                # Subscribe to index for polling
+                self.market_feed.subscribe_index(
+                    token=self.index_token,
+                    symbol="Nifty 50",
+                    exchange="NSE"
+                )
+                self.market_feed.connect()
+            else:
+                logger.info("📊 Using WebSocket feed")
+                self.market_feed = MarketFeed(
+                    auth_token=self.auth.jwt_token,
+                    api_key=self.auth.api_key,
+                    client_code=self.auth.client_code,
+                    feed_token=self.auth.feed_token
+                )
+                self.market_feed.connect()
+                
+                # Subscribe to index
+                self.market_feed.subscribe_index(
+                    token=self.index_token,
+                    mode=SubscriptionMode.LTP
+                )
             
             # Main loop
             tick_count = 0
@@ -622,6 +786,11 @@ class AdaptiveTradingBot:
         if self.strategy:
             status = self.strategy.get_status()
             logger.info(f"Final Status: Trades={status['trades_today']}, PnL={status['daily_pnl']:.2f}")
+        
+        # End database session
+        if self.db and self.session_id:
+            self.db.end_session(self.session_id, market_close=0.0)
+            logger.info(f"📝 Session #{self.session_id} ended in database")
             
         if self.telegram:
             await self.telegram.send_bot_stopped("Normal shutdown")
@@ -631,7 +800,18 @@ class AdaptiveTradingBot:
 
 def main():
     """Entry point"""
-    bot = AdaptiveTradingBot()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Adaptive Hybrid Trading Bot')
+    parser.add_argument('--paper', action='store_true', help='Run in paper trading mode')
+    parser.add_argument('--polling', action='store_true', help='Use REST API polling instead of WebSocket')
+    args = parser.parse_args()
+    
+    if args.polling:
+        logger.info("🔄 Polling mode enabled (REST API)")
+    if args.paper:
+        logger.info("📝 Paper trading mode enabled")
+    
+    bot = AdaptiveTradingBot(use_polling=args.polling, paper_mode=args.paper)
     
     # Setup signal handlers
     loop = asyncio.new_event_loop()

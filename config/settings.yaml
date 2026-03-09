@@ -1,28 +1,33 @@
-# Adaptive Hybrid Strategy Configuration v1.0
+# VWAP + PDH/PDL Fusion Strategy Configuration
 # =====================================================
-# 🎯 REGIME-BASED TRADING WITH VWAP + VOLUME PROFILE 🎯
+# 🎯 HIGH PROBABILITY BREAKOUT WITH VWAP CONFIRMATION 🎯
 # =====================================================
 
 strategy:
-  name: "Adaptive Hybrid Strategy"
-  version: "1.0.0"
+  name: "VWAP + PDH/PDL Fusion"
+  version: "2.0.0"
   
   # Entry parameters
   entry:
-    atr_sl_multiplier: 1.0       # SL = 1x ATR (dynamic)
-    min_rr_ratio: 2.0            # Minimum 1:2 Risk:Reward
-    max_trades_per_day: 4        # Max trades per day (was 3)
+    vwap_buffer: 5               # Points above/below VWAP for bias
+    pdhl_buffer: 5               # Breakout buffer for PDH/PDL
+    vwap_stability: 3            # Consecutive candles to confirm VWAP bias
+    sl_type: "conservative"      # 'conservative' (PDH/PDL) or 'aggressive' (midpoint)
+    atr_sl_multiplier: 0.5       # ATR-based SL multiplier (~10-12 points)
+    min_rr_ratio: 1.5            # Minimum 1:1.5 Risk:Reward
+    target_rr_1: 1.5             # First target R:R (exit 50%)
+    target_rr_2: 2.5             # Second target R:R (exit remaining)
+    max_trades_per_day: 3        # Max trades per day
     max_daily_loss_pct: 2.0      # Max 2% daily loss
-    signal_cooldown_minutes: 3   # Wait 3 min between signals (was 5)
-    min_confidence: 0.65         # Min 65% regime confidence (was 0.7)
+    multi_breakout: true         # Allow re-entry after exit on same level
+    cooldown_candles: 15         # Wait 15 candles (15 min) after exit before re-entry
     
   # Trading windows  
   trading_hours:
-    morning_start: "09:30"       # Wait 15 min after open
-    morning_end: "11:30"
-    afternoon_start: "13:00"
-    afternoon_end: "15:00"
-    no_new_trades_after: "14:30" # No new entries after 2:30 PM
+    entry_start: "09:30"         # Wait 15 min after open (let market settle)
+    best_window_end: "11:30"     # Morning momentum window
+    entry_end: "15:00"           # No new trades after 3 PM
+    no_new_trades_after: "15:00" # Cutoff for new entries
     
   # Regime detection parameters
   regime:
@@ -33,22 +38,22 @@ strategy:
     
   # VWAP settings
   vwap:
-    band_multiplier: 2.0         # Upper/Lower band = VWAP ± 2σ
-    bias_threshold: 2.0          # Points above/below VWAP for bias
+    band_multiplier: 1.0         # Upper/Lower band = VWAP ± 1σ
     
-  # Volume Profile settings
-  volume_profile:
-    tick_size: 0.5               # Price grouping for NIFTY
-    value_area_pct: 0.70         # 70% value area
-    
-  # Trending market entry (pullback to VWAP)
-  trending:
-    pullback_min_pct: -0.15      # Min % below VWAP
-    pullback_max_pct: 0.10       # Max % above VWAP
-    
-  # Sideways market entry (mean reversion)
-  sideways:
-    level_tolerance_atr: 0.3     # Entry within 0.3 ATR of VAH/VAL
+  # Market Structure (PDH/PDL)
+  market_structure:
+    swing_lookback: 5            # Candles for swing detection
+    atr_period: 14               # ATR for level calculations
+    # Option to fetch previous day levels from API (set false to use only today's data)
+    fetch_prev_day_from_api: false  # Use API to get yesterday's H/L/C
+    # If fetch_prev_day_from_api is false AND fallbacks are 0, uses opening range
+    fallback_pdh: 0              # Set to 0 to use today's opening range
+    fallback_pdl: 0              # Set to 0 to use today's opening range  
+    fallback_pdc: 0              # Set to 0 to use today's opening range
+    use_opening_range: true      # Use first 15 min (9:15-9:30) High/Low as levels
+    # Dynamic PDH/PDL - uses rolling high/low of last N candles
+    dynamic_levels: false        # Disabled - use static PDH/PDL with multi-breakout instead
+    dynamic_lookback: 60         # Rolling window in candles (not used when dynamic_levels=false)
 
 # Index Configuration
 index:

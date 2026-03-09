@@ -24,19 +24,8 @@ from loguru import logger
 from execution.order_manager import OrderManager, OrderStatus, get_order_manager
 from data.candle_builder import Candle
 
-
-# Stub StateStore for compatibility (state_store.py was removed)
-class StateStore:
-    """Minimal state store stub"""
-    def get_daily_stats(self) -> Dict[str, Any]:
-        return {"sl_count": 0, "trade_count": 0, "pnl": 0.0}
-    def update_daily_stats(self, **kwargs):
-        pass
-    def update_trade_sl(self, **kwargs):
-        pass
-
-def get_state_store() -> StateStore:
-    return StateStore()
+# Import database-backed StateStore
+from core.database import DatabaseStateStore, get_state_store
 
 
 class SLStatus(Enum):
@@ -146,7 +135,7 @@ class StopLossManager:
     def __init__(
         self,
         order_manager: Optional[OrderManager] = None,
-        state_store: Optional[StateStore] = None,
+        state_store: Optional[DatabaseStateStore] = None,
         initial_sl_points: float = DEFAULT_INITIAL_SL,
         breakeven_trigger_points: float = DEFAULT_BREAKEVEN_TRIGGER,
         tsl_buffer: float = DEFAULT_TSL_BUFFER,
@@ -211,6 +200,7 @@ class StopLossManager:
         exchange: str,
         quantity: int,
         entry_price: float,
+        stop_loss: Optional[float] = None,
         initial_swing_lows: Optional[List[SwingLow]] = None
     ) -> Optional[str]:
         """
@@ -222,6 +212,7 @@ class StopLossManager:
             exchange: Exchange
             quantity: Position quantity
             entry_price: Entry price
+            stop_loss: Strategy-calculated stop loss price (ATR-based). If None, uses default 5pt.
             initial_swing_lows: Pre-entry swing lows from N-Structure
             
         Returns:
@@ -232,7 +223,14 @@ class StopLossManager:
         self._exchange = exchange
         self._quantity = quantity
         
-        initial_sl = entry_price - self.initial_sl_points
+        # Use strategy's ATR-based SL if provided, else fallback to default
+        if stop_loss is not None:
+            initial_sl = stop_loss
+            sl_points = entry_price - stop_loss
+            logger.info(f"Using strategy SL: {stop_loss:.2f} ({sl_points:.1f}pt from entry)")
+        else:
+            initial_sl = entry_price - self.initial_sl_points
+            logger.warning(f"No SL provided, using default {self.initial_sl_points}pt")
         
         # Place SL order
         response = self._order_manager.place_sl_order(

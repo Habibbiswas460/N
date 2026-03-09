@@ -142,6 +142,10 @@ class MarketFeed:
         
         # Thread-safe queue for async polling
         self._tick_queue: queue.Queue = queue.Queue()
+
+        # Lock for reconnection
+        self._reconnect_lock = threading.Lock()
+        self._reconnect_thread: Optional[threading.Thread] = None
         
     def _create_websocket(self) -> None:
         """Create WebSocket instance with callbacks."""
@@ -219,37 +223,46 @@ class MarketFeed:
     def _on_error(self, wsapp, error: str) -> None:
         """Handle WebSocket errors."""
         logger.error(f"WebSocket error: {error}")
+        if self._is_connected:
+            self._is_connected = False
+            for callback in self._connection_callbacks:
+                try:
+                    callback(False)
+                except Exception as e:
+                    logger.error(f"Connection callback error: {e}")
+            self._start_reconnect_thread()
         
     def _on_close(self, wsapp) -> None:
         """Handle WebSocket connection close."""
         logger.warning("WebSocket disconnected")
         self._is_connected = False
-        
-        # Notify connection callbacks
         for callback in self._connection_callbacks:
             try:
                 callback(False)
             except Exception as e:
                 logger.error(f"Connection callback error: {e}")
-        
-        # Attempt reconnection
-        self._schedule_reconnect()
+        self._start_reconnect_thread()
+
+    def _start_reconnect_thread(self):
+        """Start a background thread for reconnection if not already running."""
+        with self._reconnect_lock:
+            if self._reconnect_thread and self._reconnect_thread.is_alive():
+                return
+            self._reconnect_thread = threading.Thread(target=self._schedule_reconnect, daemon=True)
+            self._reconnect_thread.start()
         
     def _schedule_reconnect(self) -> None:
-        """Schedule reconnection with exponential backoff."""
-        if self._reconnect_attempts >= self._max_reconnect_attempts:
-            logger.error("Max reconnection attempts reached")
-            return
-            
-        self._reconnect_attempts += 1
-        delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
-        delay = min(delay, 60)  # Cap at 60 seconds
-        
-        logger.info(f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_attempts})")
-        
-        # Note: In async version, use asyncio.sleep
-        time.sleep(delay)
-        self.connect()
+        """Schedule reconnection with exponential backoff in a background thread."""
+        while self._reconnect_attempts < self._max_reconnect_attempts:
+            self._reconnect_attempts += 1
+            delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
+            delay = min(delay, 60)
+            logger.info(f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_attempts})")
+            time.sleep(delay)
+            if self.connect():
+                logger.success("Reconnection successful")
+                return
+        logger.error("Max reconnection attempts reached. Giving up.")
         
     def _resubscribe_all(self) -> None:
         """Re-subscribe to all previously subscribed tokens."""

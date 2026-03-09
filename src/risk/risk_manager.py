@@ -20,17 +20,8 @@ from enum import Enum
 
 from loguru import logger
 
-
-# Stub StateStore for compatibility (state_store.py was removed)
-class StateStore:
-    """Minimal state store stub"""
-    def get_daily_stats(self) -> Dict[str, Any]:
-        return {"sl_count": 0, "trade_count": 0, "pnl": 0.0}
-    def update_daily_stats(self, **kwargs):
-        pass
-
-def get_state_store() -> StateStore:
-    return StateStore()
+# Import database-backed StateStore
+from core.database import DatabaseStateStore, get_state_store
 
 
 class RiskEvent(Enum):
@@ -199,7 +190,7 @@ class RiskManager:
     def __init__(
         self,
         limits: Optional[RiskLimits] = None,
-        state_store: Optional[StateStore] = None
+        state_store: Optional[DatabaseStateStore] = None
     ):
         """
         Initialize risk manager.

@@ -17,6 +17,8 @@ v2.0: Comprehensive rate limit handling
 - Graceful degradation
 """
 
+import asyncio
+import queue
 import time
 import threading
 from datetime import datetime, time as dtime
@@ -84,6 +86,9 @@ class PollingMarketFeed:
         
         # Latest ticks
         self._latest_ticks: Dict[str, TickData] = {}
+        
+        # Thread-safe queue for async get_tick()
+        self._tick_queue: queue.Queue = queue.Queue(maxsize=1000)
         
         # Rate limit tracking (SmartAPI documentation)
         self._rate_limit_errors = 0  # Consecutive 429/rate limit errors
@@ -233,6 +238,12 @@ class PollingMarketFeed:
                     # Store and notify
                     self._latest_ticks[token] = tick
                     
+                    # Add to async queue for get_tick()
+                    try:
+                        self._tick_queue.put_nowait(tick)
+                    except queue.Full:
+                        pass  # Drop oldest if queue is full
+                    
                     for callback in self._tick_callbacks:
                         try:
                             callback(tick)
@@ -296,6 +307,12 @@ class PollingMarketFeed:
                                 timestamp=datetime.now()
                             )
                             self._latest_ticks[token] = tick
+                            
+                            # Add to async queue for get_tick()
+                            try:
+                                self._tick_queue.put_nowait(tick)
+                            except queue.Full:
+                                pass  # Drop oldest if queue is full
                             
                             # Call all registered callbacks
                             for callback in self._tick_callbacks:
@@ -376,6 +393,30 @@ class PollingMarketFeed:
     def get_latest_tick(self, token: str) -> Optional[TickData]:
         """Get latest tick for a token."""
         return self._latest_ticks.get(token)
+    
+    async def get_tick(self, timeout: float = 1.0) -> Optional[TickData]:
+        """
+        Get next tick from queue (async).
+        
+        Compatible with MarketFeed interface for main.py
+        
+        Args:
+            timeout: Max seconds to wait for tick
+            
+        Returns:
+            TickData or None if timeout
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self._tick_queue.get(timeout=timeout)
+                ),
+                timeout=timeout + 0.5
+            )
+        except (asyncio.TimeoutError, queue.Empty):
+            return None
         
     @property
     def is_connected(self) -> bool:

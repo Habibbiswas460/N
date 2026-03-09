@@ -60,34 +60,60 @@ class MarketStructure:
     2. Pivot points and Fibonacci levels
     3. Swing highs and lows
     4. Support/Resistance zones
+    5. Dynamic intraday levels (optional)
     """
     
-    def __init__(self, swing_lookback: int = 5, atr_period: int = 14):
+    def __init__(self, swing_lookback: int = 5, atr_period: int = 14,
+                 fallback_pdh: float = 0.0, fallback_pdl: float = 0.0,
+                 fallback_pdc: float = 0.0, use_opening_range: bool = True,
+                 dynamic_levels: bool = False, dynamic_lookback: int = 60):
         """
         Args:
             swing_lookback: Candles to look for swing confirmation
             atr_period: Period for ATR calculation
+            fallback_pdh: Fallback PDH if no previous day data
+            fallback_pdl: Fallback PDL if no previous day data
+            fallback_pdc: Fallback PDC if no previous day data
+            use_opening_range: Use first 15 min as range if no levels
+            dynamic_levels: Enable dynamic intraday PDH/PDL (rolling high/low)
+            dynamic_lookback: Number of candles for rolling high/low (default 60 = 1 hour)
         """
         self.swing_lookback = swing_lookback
         self.atr_period = atr_period
+        self.use_opening_range = use_opening_range
+        self.dynamic_levels = dynamic_levels
+        self.dynamic_lookback = dynamic_lookback
         
-        # Daily tracking
-        self._prev_day_high: Optional[float] = None
-        self._prev_day_low: Optional[float] = None
-        self._prev_day_close: Optional[float] = None
+        # Daily tracking - initialize with fallbacks if provided
+        self._prev_day_high: Optional[float] = fallback_pdh if fallback_pdh > 0 else None
+        self._prev_day_low: Optional[float] = fallback_pdl if fallback_pdl > 0 else None
+        self._prev_day_close: Optional[float] = fallback_pdc if fallback_pdc > 0 else None
+        self._fallback_used: bool = fallback_pdh > 0
+        
+        if self._fallback_used:
+            logger.info(f"MarketStructure: Using fallback levels | "
+                       f"PDH={fallback_pdh:.2f} PDL={fallback_pdl:.2f} PDC={fallback_pdc:.2f}")
         self._current_day_high: float = 0.0
         self._current_day_low: float = float('inf')
         self._last_date: Optional[date] = None
         
         # Swing tracking
-        self._candle_history: deque = deque(maxlen=50)
+        self._candle_history: deque = deque(maxlen=max(50, dynamic_lookback + 10))
         self._swing_highs: List[SwingPoint] = []
         self._swing_lows: List[SwingPoint] = []
+        
+        # Dynamic level tracking (rolling high/low)
+        self._dynamic_high: float = 0.0
+        self._dynamic_low: float = float('inf')
+        self._dynamic_close: float = 0.0
         
         # ATR tracking
         self._tr_values: deque = deque(maxlen=atr_period)
         self._atr: float = 0.0
         self._prev_close: Optional[float] = None
+        
+        if dynamic_levels:
+            logger.info(f"MarketStructure: Dynamic levels ENABLED | Lookback={dynamic_lookback} candles")
         
     def update(self, high: float, low: float, close: float, 
                timestamp: datetime) -> Optional[MarketLevels]:
@@ -108,6 +134,10 @@ class MarketStructure:
             # Reset current day
             self._current_day_high = high
             self._current_day_low = low
+            
+            # Reset dynamic levels for new day
+            self._dynamic_high = 0.0
+            self._dynamic_low = float('inf')
             
             logger.info(f"MarketStructure: New day | PDH={self._prev_day_high:.2f} "
                        f"PDL={self._prev_day_low:.2f} PDC={self._prev_day_close:.2f}")
@@ -130,13 +160,103 @@ class MarketStructure:
             'timestamp': timestamp
         })
         
+        # Update dynamic levels if enabled
+        if self.dynamic_levels:
+            self._update_dynamic_levels(close)
+        
         # Detect swings
         self._detect_swings(timestamp)
+        
+        # Try opening range fallback if no PDH/PDL and use_opening_range enabled
+        if self._prev_day_high is None and self.use_opening_range:
+            self._try_opening_range_fallback(timestamp)
         
         # Return levels if we have previous day data
         if self._prev_day_high is not None:
             return self._calculate_levels()
         return None
+        
+    def _try_opening_range_fallback(self, timestamp: datetime):
+        """
+        Use first 15 minutes of trading as fallback PDH/PDL
+        This helps when bot starts fresh without previous day data
+        """
+        current_time = timestamp.time()
+        opening_range_end = time(9, 30)  # First 15 min: 9:15 to 9:30
+        
+        # Only calculate after opening range is complete
+        if current_time < opening_range_end:
+            return
+            
+        # Need enough candles (at least 14 for 14 min of data)
+        if len(self._candle_history) < 14:
+            return
+            
+        # Calculate opening range from first 15 candles
+        first_candles = list(self._candle_history)[:15]
+        opening_high = max(c['high'] for c in first_candles)
+        opening_low = min(c['low'] for c in first_candles)
+        opening_close = first_candles[-1]['close']
+        
+        # Extend range by 20% for buffer
+        range_size = opening_high - opening_low
+        buffer = range_size * 0.2
+        
+        self._prev_day_high = opening_high + buffer
+        self._prev_day_low = opening_low - buffer
+        self._prev_day_close = opening_close
+        
+        logger.info(f"MarketStructure: Using OPENING RANGE as fallback | "
+                   f"PDH={self._prev_day_high:.2f} PDL={self._prev_day_low:.2f} "
+                   f"PDC={self._prev_day_close:.2f} (15min range + 20% buffer)")
+        
+    def set_levels(self, pdh: float, pdl: float, pdc: float):
+        """
+        Manually set PDH/PDL/PDC levels
+        Useful for setting levels from external source or config
+        """
+        self._prev_day_high = pdh
+        self._prev_day_low = pdl
+        self._prev_day_close = pdc
+        logger.info(f"MarketStructure: Manual levels set | "
+                   f"PDH={pdh:.2f} PDL={pdl:.2f} PDC={pdc:.2f}")
+    
+    def _update_dynamic_levels(self, current_close: float):
+        """
+        Update dynamic PDH/PDL based on rolling window of candles.
+        
+        Uses the last N candles (dynamic_lookback) to calculate
+        rolling high and low for more responsive levels.
+        """
+        if len(self._candle_history) < self.dynamic_lookback:
+            # Not enough data yet, use what we have
+            candles = list(self._candle_history)
+        else:
+            # Use last N candles
+            candles = list(self._candle_history)[-self.dynamic_lookback:]
+        
+        if not candles:
+            return
+            
+        # Calculate rolling high/low
+        self._dynamic_high = max(c['high'] for c in candles)
+        self._dynamic_low = min(c['low'] for c in candles)
+        self._dynamic_close = current_close
+        
+    def get_dynamic_levels(self) -> Optional[dict]:
+        """
+        Get current dynamic PDH/PDL levels.
+        Returns None if not enough data.
+        """
+        if self._dynamic_high == 0.0 or self._dynamic_low == float('inf'):
+            return None
+            
+        return {
+            'pdh': self._dynamic_high,
+            'pdl': self._dynamic_low,
+            'pdc': self._dynamic_close,
+            'range': self._dynamic_high - self._dynamic_low
+        }
         
     def _update_atr(self, high: float, low: float, close: float):
         """Update ATR calculation"""
@@ -156,9 +276,25 @@ class MarketStructure:
             
     def _calculate_levels(self) -> Optional[MarketLevels]:
         """Calculate all market structure levels"""
-        pdh = self._prev_day_high
-        pdl = self._prev_day_low
-        pdc = self._prev_day_close
+        # Use dynamic levels if enabled - use TODAY's running high/low
+        # This means: PDH = today's high so far, PDL = today's low so far
+        # A breakout above PDH = making new day high (bullish)
+        # A breakout below PDL = making new day low (bearish)
+        if self.dynamic_levels:
+            # Use today's running high/low (after opening range established)
+            if self._current_day_high > 0 and self._current_day_low < float('inf'):
+                pdh = self._current_day_high
+                pdl = self._current_day_low
+                pdc = self._prev_close or pdl  # Use current close as reference
+            else:
+                # Fallback to static levels
+                pdh = self._prev_day_high
+                pdl = self._prev_day_low
+                pdc = self._prev_day_close
+        else:
+            pdh = self._prev_day_high
+            pdl = self._prev_day_low
+            pdc = self._prev_day_close
         
         # Return None if previous day data not available
         if pdh is None or pdl is None or pdc is None:

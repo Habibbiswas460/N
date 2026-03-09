@@ -1,80 +1,58 @@
-# Adaptive Hybrid Trading System v3.0
+# VWAP + PDH/PDL Fusion Trading Bot
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Status: Production Ready](https://img.shields.io/badge/Status-Production_Ready-green.svg)]()
-[![Control Center](https://img.shields.io/badge/Control_Center-v3.0-purple.svg)]()
+[![Angel One](https://img.shields.io/badge/Broker-Angel_One-orange.svg)]()
 
-NIFTY options trading bot using **Adaptive Hybrid Strategy** - a regime-based approach combining VWAP, Volume Profile, and Market Structure analysis via Angel One SmartAPI.
-
-> ⚠️ **Private Repository** - For personal use only.
+NIFTY options trading bot using **VWAP + PDH/PDL Fusion** strategy with multi-breakout mode via Angel One SmartAPI.
 
 ---
 
-## 🎮 Control Center v3.0
+## 🎮 Control Center
 
 ```bash
 ./start.sh
 ```
 
-**Features:**
-- 🎨 **Ultra Professional UI** - Animated, colorful terminal interface
-- 📊 **Live Status Dashboard** - Real-time capital, P&L, trades
-- 🚀 **One-Click Trading** - Start/Stop Live or Paper trading
-- 🔬 **Built-in Backtest** - Run strategy backtests
-- 📱 **Telegram Menu** - Control bot via Telegram commands
-- 📜 **Live Logs** - Real-time log viewing
+| Key | Action |
+|-----|--------|
+| `l` | Live Trading |
+| `p` | Paper Trading |
+| `x` | Stop Bot |
+| `t` | Today's Report |
+| `b` | Run Backtest |
+| `c` | Config |
+| `g` | Logs |
 
 ---
 
-## 🎯 Strategy Overview
+## 🎯 Strategy
 
 ```
-Market Regime Detection (1m + 5m Confirmation)
+PDH/PDL Breakout + VWAP Confirmation
            ↓
-┌─────────────────────────────────────────────────┐
-│  TRENDING_UP    → CE Entry (VWAP + Volume)      │
-│  TRENDING_DOWN  → PE Entry (VWAP + Volume)      │
-│  RANGING        → Support/Resistance plays      │
-│  VOLATILE       → Wide stop, quick profit       │
-│  UNKNOWN        → No trade                      │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────┐
+│  Price > PDH + VWAP bias UP → CE    │
+│  Price < PDL + VWAP bias DOWN → PE  │
+│  Multi-breakout: re-entry allowed   │
+│  15 candle cooldown after exit      │
+└─────────────────────────────────────┘
 ```
 
-**Core Components:**
-1. **VWAP** - Dynamic support/resistance with standard deviation bands
-2. **Volume Profile** - POC, VAH, VAL for key levels
-3. **Market Regime** - ADX, ATR, Bollinger for regime detection
-4. **5-Min Confirmation** - Multi-timeframe regime agreement
-5. **Signal Cooldown** - 5 minutes between signals
+**Key Features:**
+- PDH/PDL breakout with VWAP confirmation
+- Multi-breakout mode (re-entry on same level after cooldown)
+- 15-candle cooldown between trades
+- Entry window: 09:30 - 15:00
+- 1.5:1 Risk-Reward minimum
 
 ---
 
-## 🔥 Features
+## 📊 Backtest (Multi-breakout vs Static)
 
-| Feature | Description |
-|---------|-------------|
-| **Regime Detection** | 5 market states: Trending Up/Down, Ranging, Volatile, Unknown |
-| **Multi-Timeframe** | 1-min + 5-min regime confirmation required |
-| **Signal Cooldown** | 5 min minimum between signals (reduce noise) |
-| **VWAP Bands** | Entry near VWAP with 2σ bands for S/R |
-| **Volume Profile** | POC, VAH, VAL levels for precision entries |
-| **Confidence Score** | Signal strength (0.5-0.9), min 70% to trade |
-| **Sniper Mode** | 1 SL per day = Day Over |
-| **Dynamic Strike** | Select ATM strike after signal confirmation |
-
----
-
-## 📊 Backtest Results (30 Days)
-
-| Metric | Value |
-|--------|-------|
-| **Win Rate** | 67.9% |
-| **Profit Factor** | 4.47 |
-| **Total P&L** | ₹64,179 |
-| **Total Trades** | 56 |
-| **Max Drawdown** | ₹4,166 |
-| **Avg Win** | ₹2,101 |
-| **Avg Loss** | ₹1,111 |
+| Mode | Trades | Win Rate | P&L |
+|------|--------|----------|-----|
+| **Multi-breakout** | 134 | 44% | +₹6,199 |
+| Static | 14 | 36% | -₹947 |
 
 ---
 
@@ -82,21 +60,20 @@ Market Regime Detection (1m + 5m Confirmation)
 
 ```
 N/
-├── config/settings.yaml        # Strategy parameters
+├── config/settings.yaml       # Strategy config
 ├── src/
-│   ├── main.py                 # Trading bot entry
-│   ├── broker/auth.py          # Angel One API
-│   ├── core/risk_manager.py    # Capital protection
-│   ├── data/                   # Market feed, Candles, Strikes
-│   ├── execution/              # Order & SL management
-│   ├── indicators/             # VWAP, Volume Profile, EMA, ATR
-│   ├── risk/                   # Position reconciler
-│   ├── strategies/             # Adaptive Hybrid Strategy
-│   └── utils/                  # Logger, Telegram
-├── scripts/backtest/           # Backtest scripts
-├── tests/                      # Unit tests
-├── data/                       # Cache
-└── logs/                       # Daily logs
+│   ├── main.py               # Entry point
+│   ├── broker/               # Angel One API
+│   ├── data/                 # Market feed
+│   ├── execution/            # Order management
+│   ├── indicators/           # VWAP, ATR, EMA
+│   ├── strategy/             # Adaptive Hybrid
+│   ├── risk/                 # Risk management
+│   └── utils/                # Logger, Telegram
+├── scripts/backtest/         # Backtesting
+├── tests/                    # Unit tests
+├── logs/YYYY-MM-DD/          # Daily logs
+└── start.sh                  # Control center
 ```
 
 ---
@@ -107,63 +84,38 @@ N/
 # Setup
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env && nano .env
+cp .env.example .env  # Add Angel One API credentials
 
-# Run Paper Trading
-python src/main.py --paper
-
-# Run Backtest
-PYTHONPATH=. python scripts/backtest/run_adaptive_backtest.py --days 30
-
-# Run Live
-python src/main.py
+# Run
+./start.sh
 ```
+
+See [QUICKSTART.md](QUICKSTART.md) for detailed setup guide.
 
 ---
 
 ## ⚙️ Key Configuration
 
 ```yaml
-strategy:
-  type: "adaptive_hybrid"
-  signal_cooldown_minutes: 5
-  min_confidence: 0.7
+# config/settings.yaml
+entry:
+  multi_breakout: true      # Allow re-entry
+  cooldown_candles: 15      # Wait after exit
+  min_rr_ratio: 1.5         # Risk-Reward
 
-exit:
-  initial_sl_points: 8.0
-  trailing_activation_points: 15.0
-
-risk:
-  position_mode: "conservative"    # 4 lots
-  max_sl_per_day: 1                # SNIPER MODE
-
-timing:
-  trading_start: "09:20"
-  no_new_trades_after: "14:30"
+trading_hours:
+  entry_start: "09:30"
+  entry_end: "15:00"
 ```
 
 ---
 
-## 🧪 Run Tests
+## 🧪 Tests
 
 ```bash
-python test_strategy.py  # 5 passing
+pytest tests/
 ```
 
 ---
 
-## 📝 Version History
-
-| Version | Date | Changes |
-|---------|------|---------|
-| **v1.0.0** | Jan 2026 | Adaptive Hybrid Strategy with VWAP, Volume Profile, Regime Detection |
-
----
-
-## ⚠️ Disclaimer
-
-This software is for educational purposes only. Trading involves significant risk.
-
----
-
-**Made with ❤️ for algorithmic trading**
+**Angel One SmartAPI | NIFTY Options | Python 3.12+**

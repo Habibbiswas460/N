@@ -492,6 +492,68 @@ class TradingDatabase:
                 return session['id']
                 
         return None
+    
+    def get_today_stats(self) -> Dict[str, Any]:
+        """Get today's trading stats for RiskManager/SLManager."""
+        today = date.today().isoformat()
+        
+        with self._get_connection() as conn:
+            stats = conn.execute("""
+                SELECT 
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN pnl_rupees > 0 THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(CASE WHEN pnl_rupees < 0 THEN 1 ELSE 0 END) as losing_trades,
+                    SUM(CASE WHEN status = 'CLOSED_SL' THEN 1 ELSE 0 END) as sl_hits,
+                    SUM(COALESCE(pnl_rupees, 0)) as total_pnl,
+                    COUNT(CASE WHEN notes LIKE '%reentry%' THEN 1 END) as reentries
+                FROM trades WHERE trade_date = ?
+            """, (today,)).fetchone()
+            
+        return {
+            'total_trades': stats['total_trades'] or 0,
+            'winning_trades': stats['winning_trades'] or 0,
+            'losing_trades': stats['losing_trades'] or 0,
+            'sl_hits': stats['sl_hits'] or 0,
+            'total_pnl': stats['total_pnl'] or 0.0,
+            'reentries': stats['reentries'] or 0,
+            'sl_count': stats['sl_hits'] or 0,
+            'trade_count': stats['total_trades'] or 0,
+            'pnl': stats['total_pnl'] or 0.0
+        }
+    
+    def update_today_stats(self, **kwargs) -> None:
+        """Placeholder for backward compatibility - stats auto-update via trades."""
+        pass
+
+
+class DatabaseStateStore:
+    """StateStore implementation backed by TradingDatabase."""
+    
+    def __init__(self, db: Optional[TradingDatabase] = None):
+        self._db = db
+    
+    @property
+    def db(self) -> TradingDatabase:
+        if self._db is None:
+            self._db = get_database()
+        return self._db
+    
+    def get_daily_stats(self) -> Dict[str, Any]:
+        """Get today's stats from database."""
+        return self.db.get_today_stats()
+    
+    def update_daily_stats(self, **kwargs) -> None:
+        """Stats auto-update when trades are recorded."""
+        pass
+    
+    def update_trade_sl(self, **kwargs) -> None:
+        """Update SL for a trade - handled by SLManager directly."""
+        pass
+
+
+def get_state_store() -> DatabaseStateStore:
+    """Get database-backed state store."""
+    return DatabaseStateStore()
 
 
 # Global instance

@@ -1,2 +1,0 @@
-trade_id,date,entry_time,entry_price,direction,symbol,strike,quantity,regime,regime_confidence,vwap,vwap_position,poc,entry_reason,exit_time,exit_price,exit_reason,status,pnl_points,pnl_rupees,pnl_percent,sl_price,sl_points,initial_risk,risk_reward,holding_minutes,atr_at_entry,notes
-20260224_001,2026-02-24,22:35:07,150.0,CE,NIFTY,23000,75,TRENDING_UP,0.85,23050.5,ABOVE,23045.0,VWAP breakout + regime confirmation,22:35:07,165.0,Target hit,CLOSED_TP,15.0,1125.0,10.0,142.0,8.0,600.0,1.875,0,45.5,Clean breakout

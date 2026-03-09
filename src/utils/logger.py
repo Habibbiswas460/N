@@ -63,27 +63,34 @@ def _format_console(record):
 
 
 def setup_logging(
-    log_dir: str = "data/logs",
+    log_dir: str = "logs",
     level: str = "INFO",
-    rotation: str = "1 day",
     retention: str = "7 days"
 ) -> None:
     """
-    Configure pro-style logging for trading bot.
+    Configure simple logging - one file per day in date folder.
+    
+    Structure:
+        logs/
+        └── 2026-03-09/
+            └── trading.log   ← All logs (info, error, trade) in one file
     
     Args:
-        log_dir: Directory for log files
+        log_dir: Base directory for logs
         level: Logging level
-        rotation: Log rotation interval
         retention: Log retention period
     """
-    log_path = Path(log_dir)
+    from datetime import date
+    
+    # Create today's date folder
+    today = date.today().isoformat()
+    log_path = Path(log_dir) / today
     log_path.mkdir(parents=True, exist_ok=True)
     
     # Remove default handler
     logger.remove()
     
-    # Pro console handler - clean & minimal
+    # Console handler - clean & minimal
     logger.add(
         sys.stderr,
         level=level,
@@ -91,23 +98,14 @@ def setup_logging(
         colorize=True
     )
     
-    # Main log file - detailed for analysis
+    # Single log file per day - ALL logs in one place
     logger.add(
         log_path / "trading.log",
-        level=level,
+        level="DEBUG",  # Capture everything
         format="{time:HH:mm:ss} | {level: <7} | {message}",
-        rotation=rotation,
+        rotation="00:00",  # New file at midnight
         retention=retention,
         compression="gz"
-    )
-    
-    # Error log - critical issues only
-    logger.add(
-        log_path / "errors.log",
-        level="ERROR",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{line} | {message}",
-        rotation=rotation,
-        retention=retention
     )
 
 
